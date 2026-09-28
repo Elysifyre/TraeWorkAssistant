@@ -4,6 +4,7 @@
 mod commands;
 mod checkin_results;
 mod device_proxy;
+mod events;
 mod fs_utils;
 mod icube_auth;
 mod jwt;
@@ -29,6 +30,45 @@ use tauri::Manager;
 pub struct TrayMenu {
     pub api_item: MenuItem<tauri::Wry>,
     pub proxy_item: MenuItem<tauri::Wry>,
+}
+
+/// 主窗口最大化状态记忆（issue #46）：无边框窗口（decorations:false）在最大化状态下
+/// 经 hide→show 后，Win32 层 WS_MAXIMIZE 样式与 Tauri 内部状态可能失同步——窗口视觉上
+/// 已还原但 isMaximized() 仍返回 true，此时 toggleMaximize 实际执行 unmaximize（空操作），
+/// 表现为「窗口无法最大化」。hide 前记录状态，show 时强制 unmaximize→maximize 重建。
+pub struct MainWindowMaximized(pub std::sync::atomic::AtomicBool);
+
+/// 隐藏主窗口到托盘：hide 前记录最大化状态（issue #46）。返回是否找到主窗口。
+fn hide_main_window(app: &tauri::AppHandle) -> bool {
+    if let Some(window) = app.get_webview_window("main") {
+        let maximized = window.is_maximized().unwrap_or(false);
+        if let Some(flag) = app.try_state::<MainWindowMaximized>() {
+            flag.0
+                .store(maximized, std::sync::atomic::Ordering::Relaxed);
+        }
+        let _ = window.hide();
+        true
+    } else {
+        false
+    }
+}
+
+/// 显示主窗口：unminimize + show + set_focus；若隐藏前为最大化，则强制
+/// unmaximize→maximize 重建最大化状态（issue #46：即使内部状态已失同步也能恢复）。
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let was_maximized = app
+            .try_state::<MainWindowMaximized>()
+            .map(|f| f.0.load(std::sync::atomic::Ordering::Relaxed))
+            .unwrap_or(false);
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        if was_maximized {
+            let _ = window.unmaximize();
+            let _ = window.maximize();
+        }
+    }
 }
 
 fn main() {
@@ -84,11 +124,7 @@ fn main() {
     #[cfg(not(debug_assertions))]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            show_main_window(app);
             if let Some(state) = app.try_state::<AppState>() {
                 fs_utils::app_log(&state.data_dir, "检测到重复启动：已聚焦已有实例窗口");
             }
@@ -104,6 +140,7 @@ fn main() {
             None,
         ))
         .manage(state)
+        .manage(MainWindowMaximized(std::sync::atomic::AtomicBool::new(false)))
         .manage(Mutex::new(Option::<commands::proxy::ProxyHandle>::None))
         .manage(Mutex::new(Option::<commands::api_server::ApiServerRuntime>::None))
         .manage(commands::checkin::CheckinGuard(tokio::sync::Mutex::new(())))
@@ -167,6 +204,8 @@ fn main() {
             commands::misc::proxy_log_detail,
             commands::misc::write_text_file,
             commands::misc::read_text_file,
+            // issue #46：前端「最小化到托盘」走此命令，hide 前记录最大化状态
+            commands::misc::minimize_to_tray,
             commands::api_server::api_server_start,
             commands::api_server::api_server_stop,
             commands::api_server::api_server_status,
@@ -364,10 +403,18 @@ fn main() {
             fs_utils::app_log(
                 &state.data_dir,
                 &format!(
-                    "应用启动: tray=enabled, launch_minimized={}, auto_start_proxy={}",
-                    settings.launch_minimized, settings.auto_start_proxy
+                    "应用启动: tray=enabled, launch_minimized={}, auto_start_proxy={}, auto_start_api={}",
+                    settings.launch_minimized, settings.auto_start_proxy, settings.auto_start_api
                 ),
             );
+
+            // issue #46：配置已声明 maximized:true，此处程序化最大化做兜底——
+            // 若创建期最大化未生效或状态失同步，启动时强制重建一次
+            if let Some(window) = app.get_webview_window("main") {
+                if !window.is_maximized().unwrap_or(false) {
+                    let _ = window.maximize();
+                }
+            }
 
             // 创建系统托盘（始终启用，支持最小化到托盘；失败不阻断启动）
             {
@@ -409,11 +456,10 @@ fn main() {
                                 let st = app.state::<AppState>();
                                 if let Some(window) = app.get_webview_window("main") {
                                     if window.is_visible().unwrap_or(false) {
-                                        let _ = window.hide();
+                                        let _ = hide_main_window(app);
                                         fs_utils::app_log(&st.data_dir, "托盘左键点击：隐藏窗口");
                                     } else {
-                                        let _ = window.show();
-                                        let _ = window.set_focus();
+                                        show_main_window(app);
                                         fs_utils::app_log(&st.data_dir, "托盘左键点击：显示窗口");
                                     }
                                 } else {
@@ -426,11 +472,10 @@ fn main() {
                                 let st = app.state::<AppState>();
                                 if let Some(window) = app.get_webview_window("main") {
                                     if window.is_visible().unwrap_or(false) {
-                                        let _ = window.hide();
+                                        let _ = hide_main_window(app);
                                         fs_utils::app_log(&st.data_dir, "菜单：隐藏窗口");
                                     } else {
-                                        let _ = window.show();
-                                        let _ = window.set_focus();
+                                        show_main_window(app);
                                         fs_utils::app_log(&st.data_dir, "菜单：显示窗口");
                                     }
                                 }
@@ -547,10 +592,9 @@ fn main() {
                 }
             }
 
-            // 启动时最小化到托盘
+            // 启动时最小化到托盘（hide_main_window 会记录最大化状态，供托盘显示时恢复）
             if settings.launch_minimized {
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.hide();
+                if hide_main_window(app.handle()) {
                     fs_utils::app_log(&state.data_dir, "启动最小化：窗口已隐藏到托盘");
                 }
             }

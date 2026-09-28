@@ -4,6 +4,31 @@
 
 ---
 
+## [3.6.4] · 2026-09-28 · API 网关流式断连检测 + 后台动作终态防护 + Issue #41/#44~#46 修复批
+
+> 范围：自 [3.6.3]（commit 8665e4c）以来的全部变更。
+
+### 新功能
+
+- **[P3] 设置新增「启动时自动开启 API 网关」（复刻 auto_start_proxy 模式）**：`Settings` 新增 `auto_start_api`（默认关，`#[serde(default)]` 向后兼容旧配置），前端 `init()` 在设置加载完成后若网关未运行则自动拉起（判重 + 静默失败兜底，与托盘启停竞态安全）；通用设置「启动」区块新增复选框并标注局域网暴露提示（网关监听 `0.0.0.0` 且无启用 Key 时匿名放行）；启动日志追加 `auto_start_api` 字段便于排查。
+
+### 修复
+
+- **[P1] API 网关流式转发客户端断连检测（issue #41 系列，24eb1d0/0028c93/73f3480/5abb891/21ea8c1）**：客户端中途断连后，后台转发线程此前持续消费上游直到 EOF——占用账号并发槽（InflightGuard/账号在途计数）形成僵尸流；现在转发链路三层检测：轮换/重试入口与退避 sleep 后 `tx.is_closed()` 快速终止、停滞期 `next_event_polling` 按 LINE_POLL 轮询断连、活跃流逐事件顶部检测，断连即终止转发并释放并发槽。覆盖三条链路：SOLO SSE 转换管线（OpenAI/OpenAiText/Anthropic 三协议，断连后跳过收尾事件）、WB 上游流式（含 `failed_inline` 语义——流内错误就地透传后不得重试/不得按成功收尾；竞速对冲胜者行源桥接同样可中断）、自定义模型直通。
+- **[P1] 后台动作 panic 后终态事件永久缺失（issue #44，1b8d3a1）**：切换/保存登录态/续期 JWT/豆包保活/快照备份恢复等后台线程 panic 时 `*-done` 终态事件从不发射，前端 `switchingTo`/`savingLogin` 永久锁死；现 catch_unwind 包裹 + `finish_action_thread` 统一终态出口（panic 转 `[fatal]` 消息），`emit_logged` 统一事件发射（emit 失败落日志）；action_gate 中毒锁恢复（`try_lock` 区分 Poisoned/WouldBlock）；前端三账号页 90s 看门狗 `clearSwitchLocks` 兜底解锁 + 新增 SwitchProgressPanel 共享进度面板（此前仅豆包页有）。
+- **[P2] Trae 安装检测对自定义安装恒报「未检测到」（issue #45，cfe8607）**：旧 `detect_trae`/`detect_trae_cn` 仅扫默认目录，自定义安装路径的用户环境检测/打开客户端始终失败；现统一走 `app_locate` 四级探测（手动指定 → 默认路径 → 注册表 → 运行进程），探测顺序对齐全库语义（默认路径优先、注册表兜底），净删 118 行重复实现；未检测到提示补充手动路径引导。
+- **[P2] 无边框窗口 hide→show 后无法最大化（issue #46，8b5e517）**：托盘隐藏再显示后 Win32 `WS_MAXIMIZE` 与 Tauri 内部状态失同步，`isMaximized()` 恒 true、点最大化变空操作；现 `MainWindowMaximized` 状态记忆（hide 前记录）+ show 时 unmaximize→maximize 强制重建（托盘左键/托盘菜单/单实例/启动最小化四路径统一）+ 启动程序化最大化兜底；前端 TitleBar `onResized` 跟踪真实状态，最大化/还原图标随状态切换，最小化按钮改走 `minimize_to_tray`（与托盘隐藏同链路）。
+
+### 文档
+
+- **[P3] wb_route 模块注释对齐断连检测语义**：3.6.3 发布后全面审查发现模块头注释仍描述 issue #41 修复前的旧行为（客户端断连后保持消费上游到 EOF），与现行「断连即终止」三层检测语义矛盾，已修正，避免误导后续维护。
+
+### 测试
+
+- cargo 单测 **564** 全绿（本周期新增：客户端断连三层检测、`InterruptibleLines` 可中断行源、后台动作 panic 终态、账号池合并语义等回归）；`tsc --noEmit` 全绿。
+
+---
+
 ## [3.6.3] · 2026-09-26 · 积分看板重建（Trae/Buddy 平台拆分）+ Issue #38 `-max` 修复批
 
 > 范围：自 [3.6.2]（tag v3.6.2，commit 89b0b6b）以来的全部变更。

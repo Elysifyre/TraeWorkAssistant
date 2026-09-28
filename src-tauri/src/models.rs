@@ -128,6 +128,9 @@ pub struct Settings {
     pub silent_checkin: bool,
     #[serde(default = "default_true")]
     pub auto_start_proxy: bool,
+    /// 启动时自动开启 API 网关（7864，监听 0.0.0.0）：默认关，避免升级后自动向局域网暴露服务
+    #[serde(default)]
+    pub auto_start_api: bool,
     #[serde(default = "default_true")]
     pub tray: bool,
     #[serde(default = "default_lang")]

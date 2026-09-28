@@ -1295,6 +1295,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
         let mut refreshed_401 = HashSet::new();
 
         for _ in 0..MAX_ROTATE {
+            // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽
+            if tx.is_closed() {
+                return;
+            }
             let mut picked = match state
                 .pool
                 .pick_excluding_constrained(&tried, trae_allowed.as_ref(), trae_dedicated.as_deref())
@@ -1325,8 +1329,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                     Ok(reader) => {
                         // 首字超时 10s（T2.7/F-34，与 wb_upstream 同款包装）：建连后
                         // 首字节 10s 未到视为上游故障 → 冷却换号；首字节到达后正常
-                        // 流速不受限（后续行无超时）
-                        let lines = match super::wb_upstream::lines_with_first_byte_timeout(reader) {
+                        // 流速不受限（后续行无超时）。可中断行源：转换循环可在
+                        // 上游停滞期间周期性检查客户端断连（sse.rs LINE_POLL）
+                        let lines = match super::wb_upstream::lines_with_first_byte_timeout_interruptible(reader)
+                        {
                             Ok(l) => l,
                             Err(()) => {
                                 state.pool.note_error(&picked.uid, ErrKind::Server);
@@ -1363,8 +1369,11 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 l
                             })
                         };
-                        let lines =
-                            Box::new(lines) as Box<dyn Iterator<Item = String> + Send>;
+                        // ttfb 包装产物为普通迭代器 → 桥接回可中断行源
+                        // （转发线程复用；转换循环的停滞期断连轮询语义不变）
+                        let lines = super::wb_upstream::InterruptibleLines::from_iterator(
+                            Box::new(lines) as Box<dyn Iterator<Item = String> + Send>,
+                        );
                         // 连接成功 → 开始流式转换，mid-stream error 只冷却不轮换
                         let (error_info, sent_any, up_usage) = match proto {
                             Protocol::OpenAi => {
@@ -1440,6 +1449,10 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                                 // 同账号重试：不 note_error 不冷却
                                 same_attempt += 1;
                                 std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
+                                // 断连检测：重试等待期间客户端离开则终止
+                                if tx.is_closed() {
+                                    return;
+                                }
                                 continue;
                             }
                             RetryAction::SwitchKey => {

@@ -352,7 +352,8 @@ pub fn workbuddy_oauth_login(app: AppHandle) -> Result<(), String> {
             }),
             Err(e) => serde_json::json!({ "ok": false, "message": e }),
         };
-        let _ = app.emit("wb-oauth-done", payload);
+        // 终态事件：emit 失败落日志（issue #44 遗留项——前端 OAuth 弹框依赖此事件收尾）
+        crate::events::emit_logged(&app, "wb-oauth-done", payload, None);
         OAUTH_RUNNING.store(false, Ordering::SeqCst);
     });
     Ok(())

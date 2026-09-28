@@ -315,7 +315,8 @@ fn spawn_watchdog(app: AppHandle, data_dir: PathBuf, gen: u64, mut exit_rx: watc
                 );
             }
         }
-        let _ = app.emit("proxy-crashed", "");
+        // 关键通知（前端弹「代理异常退出」）：emit 失败落日志（issue #44 遗留项）
+        crate::events::emit_logged(&app, "proxy-crashed", serde_json::Value::String(String::new()), Some(&data_dir));
         sync_tray_proxy_text(&app, false);
     });
 }

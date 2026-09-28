@@ -183,6 +183,15 @@ export default function GeneralSettingsPanel() {
               启动静默签到
               <span className="text-xs text-slate-400">（启动 60 秒后自动为未签到账号签到）</span>
             </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="checkbox"
+                checked={form.auto_start_api}
+                onChange={(e) => update('auto_start_api', e.target.checked)}
+              />
+              启动时自动开启 API 网关
+              <span className="text-xs text-slate-400">（网关监听所有网卡，局域网设备可访问）</span>
+            </label>
             <p className="text-xs text-slate-400">托盘与最小化设置变更后需重启应用生效。</p>
           </div>
         </div>

@@ -42,6 +42,14 @@ pub fn autostart_set(app: AppHandle, enabled: bool) -> Result<(), String> {
     }
 }
 
+/// 最小化到托盘（issue #46）：与托盘隐藏同链路，hide 前记录最大化状态，
+/// 供托盘/单实例 show 时强制重建最大化（规避无边框窗口 hide/show 后最大化失同步）
+#[tauri::command]
+pub fn minimize_to_tray(app: AppHandle) -> Result<(), String> {
+    crate::hide_main_window(&app);
+    Ok(())
+}
+
 // ---------------- 代理请求日志 ----------------
 
 #[derive(Serialize, Clone)]

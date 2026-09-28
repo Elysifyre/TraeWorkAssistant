@@ -214,7 +214,15 @@ impl TauriSink {
 
 impl ProgressSink for TauriSink {
     fn step(&self, stage: &str, status: StepStatus, message: &str) {
-        let _ = self.app.emit(self.event, step_line(stage, status, message));
+        // issue #44：emit 失败不再静默——落 switcher.log，避免前端收不到进度/
+        // 终态事件却无任何线索（表现为「一直显示切换中」）
+        if let Err(e) = self.app.emit(self.event, step_line(stage, status, message)) {
+            append_switcher_log(
+                &self.log_file,
+                "emit-error",
+                &format!("事件 {} 发送失败（前端可能收不到进度/结束信号）: {e}", self.event),
+            );
+        }
         append_switcher_log(&self.log_file, stage, message);
     }
 }
@@ -407,9 +415,17 @@ fn action_gate() -> &'static std::sync::Mutex<()> {
 /// 执行一个桥动作。返回 Ok = 最终 done 步骤的消息（供 *-done 事件 raw 字段）；
 /// Err = 失败终态消息（fatal 步骤已由内部按原时机输出，调用点不得再补发）。
 pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, String> {
-    let _guard = action_gate()
-        .try_lock()
-        .map_err(|_| "已有切换/备份操作进行中，请稍后再试".to_string())?;
+    // issue #44 审查修复：try_lock 的 Err 有两种——WouldBlock（确实忙碌，拒绝）
+    // 与 Poisoned（上次持有者 panic 中毒）。毒化只说明上一次动作异常终止，数据本身
+    // 是 () 无不变量可破坏，into_inner() 恢复即可；否则一次 panic 后所有后续
+    // 切换/备份永久报「已有切换/备份操作进行中」。
+    let _guard = match action_gate().try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return Err("已有切换/备份操作进行中，请稍后再试".to_string());
+        }
+        Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+    };
 
     // ── 入参校验（PS 1402-1411：UserId 必填/格式白名单，双保险与命令层独立）──
     let needs_uid = !matches!(

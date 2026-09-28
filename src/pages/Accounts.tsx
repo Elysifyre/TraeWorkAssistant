@@ -24,6 +24,7 @@ import {
   Zap,
 } from 'lucide-react';
 import PageHeader from '../components/PageHeader';
+import SwitchProgressPanel from '../components/SwitchProgressPanel';
 import { Badge, EmptyState } from '../components/ui';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { useAppStore } from '../store';
@@ -110,10 +111,12 @@ export default function Accounts() {
   const [deleteTarget, setDeleteTarget] = useState<AccountView | null>(null);
   const [deleteSlot, setDeleteSlot] = useState<string | null>(null);
   // 切换/保存 90s 看门狗（对齐 BuddyAccounts）：switch-done / save-login-done 事件异常缺失
-  // （桥挂死/事件丢失）时 switchingTo/savingLogin 会永久非空——全部切换/保存/续期/重置按钮
-  // 被禁用、appMenu 不再弹出，用户感知为「点击切换账号无反应」。90s 后本地解除按钮互斥兜底
-  //（store 状态只读，此处仅页面级解锁；事件迟到仍会正常提示结果）。
+  // （桥挂死/事件丢失/后台线程 panic）时 switchingTo/savingLogin 会永久非空——全部切换/保存/
+  // 续期/重置按钮被禁用、appMenu 不再弹出，用户感知为「点击切换账号无反应」。90s 后解除
+  // 按钮互斥并清空 store 进行中状态（issue #44：仅页面级解锁会让 spinner/「切换中…」
+  // 永久显示；事件迟到仍会正常提示结果）。
   const [lockTimedOut, setLockTimedOut] = useState(false);
+  const clearSwitchLocks = useAppStore((s) => s.clearSwitchLocks);
   const busy = (!!switchingTo || !!savingLogin) && !lockTimedOut;
   useEffect(() => {
     if (!switchingTo && !savingLogin) {
@@ -123,6 +126,7 @@ export default function Accounts() {
     setLockTimedOut(false);
     const timer = setTimeout(() => {
       setLockTimedOut(true);
+      clearSwitchLocks();
       toast('warn', '切换/保存超过 90 秒未收到完成事件，已解除按钮锁定；结果请以日志与列表状态为准');
     }, 90_000);
     return () => clearTimeout(timer);
@@ -348,6 +352,9 @@ export default function Accounts() {
           </>
         }
       />
+
+      {/* 切换/保存进度面板（issue #44 遗留项：含「续期 JWT」内的切换流程） */}
+      <SwitchProgressPanel />
 
       <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
         <button

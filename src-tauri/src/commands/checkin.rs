@@ -153,7 +153,8 @@ fn emit_final_done(app: &AppHandle, ok: usize, already: usize, failed: usize, to
         "type": "done", "ok": ok, "already": already, "failed": failed, "total": total
     });
     let _ = app.emit("checkin-progress", &payload);
-    let _ = app.emit("checkin-done", &payload);
+    // 终态事件：emit 失败落日志（issue #44 遗留项——前端签到横幅依赖 done 复位）
+    crate::events::emit_logged(app, "checkin-done", payload, None);
     if notify_done {
         crate::notify::notify(
             app,
@@ -315,9 +316,12 @@ fn run_checkin_worker(
             "checkin-progress",
             serde_json::json!({ "type": "done", "ok": 0, "already": 0, "failed": 0, "total": 0, "empty": true }),
         );
-        let _ = app.emit(
+        // 终态事件：emit 失败落日志（issue #44 遗留项）
+        crate::events::emit_logged(
+            app,
             "checkin-done",
             serde_json::json!({ "type": "done", "ok": 0, "already": 0, "failed": 0, "total": 0, "empty": true }),
+            Some(&state.data_dir),
         );
         if notify_done {
             crate::notify::notify(app, "签到完成", "没有需要签到的账号（全部已签/冷却中）");

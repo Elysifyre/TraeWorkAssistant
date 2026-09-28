@@ -176,7 +176,8 @@ pub fn custom_stream_chat(
 
         let prepared = prep_body(&body_vec, &cm);
         match make_custom_request(&cm, &prepared) {
-            Ok(reader) => match wb_upstream::lines_with_first_byte_timeout(reader) {
+            // 可中断行源：stream_forward 停滞期间周期性检查客户端断连
+            Ok(reader) => match wb_upstream::lines_with_first_byte_timeout_interruptible(reader) {
                 Ok(lines) => {
                     let (error_info, sent_any, up_usage) =
                         wb_sse::stream_forward(lines, &tx, proto, &chat_id, &model);

@@ -20,29 +20,15 @@ pub struct EnvStatus {
 
 #[tauri::command(async)]
 pub fn env_check(_app: AppHandle, state: State<AppState>) -> EnvStatus {
-    // F-75：Windows 走 env 直读探测链；mac 复用 app_locate bundle 定位链
-    // （settings → bundle 探测 → mdfind → 进程回退，双信号白名单防串台）
-    let (installed, path, version) = {
-        #[cfg(windows)]
-        {
-            detect_trae(state.settings().trae_path)
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let r = app_locate_inner(&state, "trae_work");
-            (r.exe.is_some(), r.exe, r.version)
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            (false, None, None)
-        }
-    };
-    let running = is_running();
+    // F-45 统一探测：env_check 与设置页 app_locate 共用同一探测链（app_locate_inner
+    // 平台分派：Windows 手动指定 → 默认路径 → 注册表 → 运行进程；mac settings →
+    // bundle 探测 → mdfind → 进程回退），自定义安装不再恒报「未检测到」（issue #45）
+    let loc = app_locate_inner(&state, "trae_work");
     EnvStatus {
-        installed,
-        running,
-        version,
-        path,
+        installed: loc.exe.is_some(),
+        running: is_running(),
+        version: loc.version,
+        path: loc.exe,
     }
 }
 
@@ -81,26 +67,26 @@ pub fn open_trae_website(_app: AppHandle) -> Result<(), String> {
 /// 无需用户在 Trae 设置里手动配置代理。
 #[tauri::command(async)]
 pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
-    // F-75：mac 走 bundle 定位 + `open`（LaunchServices 单实例激活，--args 透传
-    // 代理参数）；Windows 保持原 exe 直启链（行为零变化）
+    // 统一探测（app_locate_inner 平台分派）：mac 命中 .app bundle、Windows 命中 exe。
+    let exe = app_locate_inner(&state, "trae_work")
+        .exe
+        .ok_or("未检测到本地 Trae Work 安装，请在「环境配置」中指定路径")?;
+    persist_detected_path(&state, "trae_path", &exe);
+    // 直开（不注入代理）前，清理可能指向已停止本地代理的残留系统代理，避免请求被 RESET
+    if proxy_port.is_none() {
+        crate::commands::proxy::cleanup_stale_local_proxy(&state);
+    }
+    // Electron 单实例：已运行的窗口会忽略新启动参数，注入代理前先三级关闭现有进程确保生效
+    // （无代理时正常打开，不杀进程。）
+    if proxy_port.is_some() {
+        crate::commands::process::graceful_kill_app("TraeWork")?;
+    }
     #[cfg(target_os = "macos")]
     {
-        let r = app_locate_inner(&state, "trae_work");
-        let Some(bundle) = r.exe else {
-            return Err("未检测到本地 Trae Work 安装，请在「环境配置」中指定路径".into());
-        };
-        persist_detected_path(&state, "trae_path", &bundle);
-        // 直开（不注入代理）前，清理可能指向已停止本地代理的残留系统代理
-        if proxy_port.is_none() {
-            crate::commands::proxy::cleanup_stale_local_proxy(&state);
-        }
-        if proxy_port.is_some() {
-            crate::commands::process::graceful_kill_app("TraeWork")?;
-        }
+        // mac：LaunchServices `open` 单实例激活 .app bundle，--args 透传代理参数给主进程
         let mut cmd = crate::platform::cmd::sys_command("open");
-        cmd.arg(&bundle);
+        cmd.arg(&exe);
         if let Some(port) = proxy_port {
-            // Electron/Chromium 支持 --proxy-server 启动参数；`open --args` 透传给主进程
             cmd.args(["--args", &format!("--proxy-server=http://127.0.0.1:{port}")]);
         }
         cmd.spawn().map_err(|e| format!("启动 Trae Work 失败: {e}"))?;
@@ -108,30 +94,12 @@ pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let (installed, path, _) = detect_trae(state.settings().trae_path);
-        if !installed {
-            return Err("未检测到本地 Trae Work 安装，请在「环境配置」中指定 exe 路径".into());
-        }
-        let exe = path.ok_or("未找到 Trae Work 可执行文件路径")?;
-        persist_detected_path(&state, "trae_path", &exe);
-        // 直开（不注入代理）前，清理可能指向已停止本地代理的残留系统代理，避免请求被 RESET
-        if proxy_port.is_none() {
-            crate::commands::proxy::cleanup_stale_local_proxy(&state);
-        }
-        // 代理注入要求 Trae 以 --proxy-server 启动。Electron 单实例下，已运行的窗口会忽略新启动
-        // 参数，再次点击只会聚焦旧窗口，导致全程不走代理、无法捕获账号。故注入代理前先关闭现有
-        // 进程，确保参数真正生效（F-47 三级关闭：优雅关闭→树杀强杀→人工介入）。
-        // （无代理时正常打开，不杀进程。）
-        if proxy_port.is_some() {
-            crate::commands::process::graceful_kill_app("TraeWork")?;
-        }
         let mut cmd = Command::new(&exe);
         if let Some(port) = proxy_port {
             // Electron/Chromium 支持 --proxy-server 启动参数
             cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
         }
-        cmd.spawn()
-            .map_err(|e| format!("启动 Trae Work 失败: {e}"))?;
+        cmd.spawn().map_err(|e| format!("启动 Trae Work 失败: {e}"))?;
         Ok(())
     }
 }
@@ -139,46 +107,37 @@ pub fn open_trae_app(_app: AppHandle, state: State<AppState>, proxy_port: Option
 /// 检测 Trae CN IDE（与 Trae Work/SOLO CN 是两个独立应用）
 #[tauri::command(async)]
 pub fn env_check_trae_cn(_app: AppHandle, state: State<AppState>) -> EnvStatus {
-    // F-75：mac 复用 app_locate bundle 定位链（同 env_check）
-    let (installed, path, version) = {
-        #[cfg(windows)]
-        {
-            detect_trae_cn(state.settings().trae_cn_path.clone())
-        }
-        #[cfg(target_os = "macos")]
-        {
-            let r = app_locate_inner(&state, "trae");
-            (r.exe.is_some(), r.exe, r.version)
-        }
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            (false, None, None)
-        }
-    };
-    let running = is_running_cn();
-    EnvStatus { installed, running, version, path }
+    let loc = app_locate_inner(&state, "trae");
+    EnvStatus {
+        installed: loc.exe.is_some(),
+        running: is_running_cn(),
+        version: loc.version,
+        path: loc.exe,
+    }
 }
 
 /// 打开 Trae CN IDE。与 Trae Work 同款代理注入：传入 proxy_port 时以 --proxy-server 启动，
 /// 让 Trae 的流量也走本地 MITM 代理（捕获账号/观察请求）。
 #[tauri::command(async)]
 pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Option<u16>) -> Result<(), String> {
-    // F-75：mac 走 bundle 定位 + `open`（同 open_trae_app）
+    // 统一探测（同 open_trae_app）：mac 命中 .app bundle、Windows 命中 exe。
+    let exe = app_locate_inner(&state, "trae")
+        .exe
+        .ok_or("未检测到 Trae 安装，请在「环境配置」中指定 Trae 安装路径")?;
+    persist_detected_path(&state, "trae_cn_path", &exe);
+    // 直开前清理可能指向已停止本地代理的残留系统代理
+    if proxy_port.is_none() {
+        crate::commands::proxy::cleanup_stale_local_proxy(&state);
+    }
+    // Electron 单实例：已运行的窗口会忽略新启动参数，注入代理前先三级关闭现有进程确保生效
+    if proxy_port.is_some() {
+        crate::commands::process::graceful_kill_app("Trae")?;
+    }
     #[cfg(target_os = "macos")]
     {
-        let r = app_locate_inner(&state, "trae");
-        let Some(bundle) = r.exe else {
-            return Err("未检测到 Trae 安装，请在「环境配置」中指定 Trae 安装路径".into());
-        };
-        persist_detected_path(&state, "trae_cn_path", &bundle);
-        if proxy_port.is_none() {
-            crate::commands::proxy::cleanup_stale_local_proxy(&state);
-        }
-        if proxy_port.is_some() {
-            crate::commands::process::graceful_kill_app("Trae")?;
-        }
+        // mac：LaunchServices `open` 单实例激活 .app bundle，--args 透传代理参数
         let mut cmd = crate::platform::cmd::sys_command("open");
-        cmd.arg(&bundle);
+        cmd.arg(&exe);
         if let Some(port) = proxy_port {
             cmd.args(["--args", &format!("--proxy-server=http://127.0.0.1:{port}")]);
         }
@@ -187,20 +146,6 @@ pub fn open_trae_cn_app(_app: AppHandle, state: State<AppState>, proxy_port: Opt
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let (installed, path, _) = detect_trae_cn(state.settings().trae_cn_path.clone());
-        if !installed {
-            return Err("未检测到 Trae 安装，请在「环境配置」中指定 Trae 安装路径".into());
-        }
-        let exe = path.ok_or("未找到 Trae 可执行文件路径")?;
-        persist_detected_path(&state, "trae_cn_path", &exe);
-        // 直开前清理可能指向已停止本地代理的残留系统代理
-        if proxy_port.is_none() {
-            crate::commands::proxy::cleanup_stale_local_proxy(&state);
-        }
-        // Electron 单实例：已运行的窗口会忽略新启动参数，注入代理前先三级关闭现有进程确保生效
-        if proxy_port.is_some() {
-            crate::commands::process::graceful_kill_app("Trae")?;
-        }
         let mut cmd = Command::new(&exe);
         if let Some(port) = proxy_port {
             cmd.arg(format!("--proxy-server=http://127.0.0.1:{port}"));
@@ -233,70 +178,8 @@ fn persist_detected_path(state: &State<AppState>, key: &str, exe: &str) {
     }
 }
 
-/// Windows 探测链专用（F-75：mac 走 app_locate bundle 定位链，见 app_locate_macos）
-#[cfg(not(target_os = "macos"))]
-fn detect_trae_cn(custom: Option<String>) -> (bool, Option<String>, Option<String>) {
-    if let Some(p) = custom {
-        let p = p.trim().to_string();
-        if !p.is_empty() && std::path::Path::new(&p).is_file() {
-            let version = version_of(&p);
-            return (true, Some(p), version);
-        }
-    }
-    let candidates = [
-        "%LOCALAPPDATA%\\Programs\\Trae CN\\Trae CN.exe",
-        "%ProgramFiles%\\Trae CN\\Trae CN.exe",
-    ];
-    for c in candidates {
-        let expanded = expand_env(c);
-        if std::path::Path::new(&expanded).exists() {
-            let version = version_of(&expanded);
-            return (true, Some(expanded), version);
-        }
-    }
-    (false, None, None)
-}
-
-/// Windows 探测链专用（F-75：mac 走 app_locate bundle 定位链，见 app_locate_macos）
-#[cfg(not(target_os = "macos"))]
-fn detect_trae(custom: Option<String>) -> (bool, Option<String>, Option<String>) {
-    // 优先使用用户在设置中指定的路径（兼容自定义安装目录）
-    if let Some(p) = custom {
-        let p = p.trim().to_string();
-        if !p.is_empty() && std::path::Path::new(&p).is_file() {
-            let version = version_of(&p);
-            return (true, Some(p), version);
-        }
-    }
-    let candidates = [
-        "%LOCALAPPDATA%\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe",
-        "%LOCALAPPDATA%\\Programs\\TRAE SOLO\\TRAE SOLO.exe",
-        "%ProgramFiles%\\TRAE SOLO CN\\TRAE SOLO CN.exe",
-        "%ProgramFiles%\\TRAE SOLO\\TRAE SOLO.exe",
-        "%LOCALAPPDATA%\\Programs\\Trae\\Trae.exe",
-        "%ProgramFiles%\\Trae\\Trae.exe",
-    ];
-    for c in candidates {
-        let expanded = expand_env(c);
-        if std::path::Path::new(&expanded).exists() {
-            let version = version_of(&expanded);
-            return (true, Some(expanded), version);
-        }
-    }
-    // 回退：注册表查询
-    if let Some(p) = registry_trae_path() {
-        let version = version_of(&p);
-        return (true, Some(p), version);
-    }
-    (false, None, None)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn expand_env(p: &str) -> String {
-    p.replace("%LOCALAPPDATA%", &std::env::var("LOCALAPPDATA").unwrap_or_default())
-        .replace("%ProgramFiles%", &std::env::var("ProgramFiles").unwrap_or_default())
-}
-
+/// 版本号读取（Windows：PowerShell 读 exe VersionInfo；mac 走 finish_locate_macos 的
+/// Info.plist CFBundleShortVersionString，本函数不参与编译——避免 dead_code 警告）
 #[cfg(not(target_os = "macos"))]
 fn version_of(path: &str) -> Option<String> {
     // 优先 ProductVersion（用户认知的产品版本，如 Trae 3.3.100 / Trae Work 0.1.65 /
@@ -324,89 +207,6 @@ fn version_of(path: &str) -> Option<String> {
         s
     };
     Some(s)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn registry_trae_path() -> Option<String> {
-    for root in ["HKCU", "HKLM"] {
-        let out = match sys_command("reg")
-            .args([
-                "query",
-                &format!("{root}\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall"),
-                "/s",
-                "/f",
-                "TRAE",
-            ])
-            .output()
-        {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
-        let s = String::from_utf8_lossy(&out.stdout);
-        // reg query /s 以 HKEY_ 开头的行分隔每个注册表键，逐键解析
-        let mut icon: Option<String> = None;
-        let mut loc: Option<String> = None;
-        let mut name_ok = false;
-        let mut best: Option<String> = None;
-        for line in s.lines() {
-            let line = line.trim();
-            if line.starts_with("HKEY_") {
-                if name_ok {
-                    if let Some(p) = resolve_reg_candidate(&icon, &loc) {
-                        best = Some(p);
-                        break;
-                    }
-                }
-                icon = None;
-                loc = None;
-                name_ok = false;
-                continue;
-            }
-            if let Some(v) = line.strip_prefix("DisplayName") {
-                if let Some(val) = v.split("REG_SZ").nth(1) {
-                    if val.to_uppercase().contains("TRAE") {
-                        name_ok = true;
-                    }
-                }
-            } else if let Some(v) = line.strip_prefix("DisplayIcon") {
-                if let Some(val) = v.split("REG_SZ").nth(1) {
-                    icon = Some(val.trim().to_string());
-                }
-            } else if let Some(v) = line.strip_prefix("InstallLocation") {
-                if let Some(val) = v.split("REG_SZ").nth(1) {
-                    loc = Some(val.trim().to_string());
-                }
-            }
-        }
-        if name_ok {
-            if let Some(p) = resolve_reg_candidate(&icon, &loc) {
-                best = Some(p);
-            }
-        }
-        if best.is_some() {
-            return best;
-        }
-    }
-    None
-}
-
-/// 从注册表 DisplayIcon / InstallLocation 推导 exe 路径
-#[cfg(not(target_os = "macos"))]
-fn resolve_reg_candidate(icon: &Option<String>, loc: &Option<String>) -> Option<String> {
-    if let Some(icon) = icon {
-        if icon.to_lowercase().ends_with(".exe") && std::path::Path::new(icon).is_file() {
-            return Some(icon.clone());
-        }
-    }
-    if let Some(loc) = loc {
-        for name in ["TRAE SOLO CN.exe", "TRAE SOLO.exe", "Trae.exe"] {
-            let cand = format!("{loc}\\{name}");
-            if std::path::Path::new(&cand).is_file() {
-                return Some(cand);
-            }
-        }
-    }
-    None
 }
 
 fn is_running_cn() -> bool {
@@ -458,11 +258,11 @@ fn is_running() -> bool {
     }
 }
 
-// ── F-01：安装位置自动识别 app_locate（跨应用通用，三级探测）────────────────
-// 探测顺序：用户手动指定（app_settings.json 持久化值）→ 注册表卸载键 → 默认路径候选
-// → 运行进程反查。方案依据 doubao-trae-switch-plan.md §1.3 / workbuddy-switch-plan.md §2.1。
-// F-75 P2-2：Windows 档案与四级链整体 cfg 门控；mac 走 bundle 定位链（app_locate_macos，
-// 设计 §4.2「app_locate 内 cfg 分派」——档案数据按应用×平台分离，非复用同一结构）。
+// ── F-01：安装位置自动识别 app_locate（跨应用通用，平台分派探测链）────────
+// Windows 四级探测：用户手动指定（app_settings.json 持久化值）→ 默认路径候选 →
+// 注册表卸载键 → 运行进程反查（F-45 对齐全库原有语义：默认路径优先、注册表兜底）。
+// macOS bundle 定位链：settings → bundle 探测 → mdfind → 进程回退。
+// 方案依据 doubao-trae-switch-plan.md §1.3 / workbuddy-switch-plan.md §2.1。
 
 #[derive(Serialize)]
 pub struct AppLocate {
@@ -549,7 +349,10 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
         // trae_work / traework / work / solo 及其它值 → 默认 Trae Work
         _ => AppProfile {
             display: "Trae Work",
-            reg_patterns: &["TRAE SOLO", "Trae Work"],
+            // 末位 "TRAE" 泛模式兜底：兼容旧 detect_trae 的 DisplayName contains
+            // "TRAE" 全量匹配（裸名 "TRAE" / 未来新形态等），仅在前两个精确模式
+            // 未命中时才触发第三次注册表扫描
+            reg_patterns: &["TRAE SOLO", "Trae Work", "TRAE"],
             reg_exe_names: &["TRAE SOLO CN.exe", "TRAE SOLO.exe", "Trae.exe"],
             exe_candidates: &[
                 "%LOCALAPPDATA%\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe",
@@ -565,6 +368,23 @@ fn app_profile(target_app: Option<&str>) -> AppProfile {
         },
     }
 }
+
+// ── macOS 移植备忘（issue #45 修复时预埋）────────────────────────────────
+// 本探测链路的 OS 耦合点集中在以下三处，移植时只需替换实现、档案表结构不变：
+// 1. app_profile 本函数：exe_candidates / user_data_dir / proc_names 需按 macOS
+//    实测路径出第二套档案（cfg(target_os) 分派）。已知映射：
+//    - exe: /Applications/Trae Code.app/Contents/MacOS/Trae Code（默认安装无
+//      per-user 目录，无 LOCALAPPDATA 等价物）
+//    - 数据目录: ~/Library/Application Support/Trae CN（对应 %APPDATA%\Trae CN）
+// 2. registry_app_path：注册表探测仅 Windows 有 → mac 实现直接返回 None
+//    （或扩展为 Info.plist/Spotlight 查询，非必须）
+// 3. process_exe_path / version_of / is_running_*：powershell+tasklist →
+//    pgrep -l / mdls 或可执行文件属性读取；CommandExt.creation_flags 为
+//    Windows 专属 API，需 cfg 包裹
+// 注意：切换器侧 switcher/locate.rs（lnk/注册表/进程六级）有同构耦合点，
+// mac 移植需一并处理；快照数据目录布局（switcher AppProfile.data_dir，即本文件
+// AppProfile.user_data_dir 的对位字段）是行为核心，
+// 移植前必须实机确认 macOS 版 Trae 的登录态文件结构与 Windows 同构。
 
 /// 打开豆包桌面版（复用 app_locate 豆包档案四级探测；命中即回写设置以便下次直开）。
 /// 与 Trae 同款代理注入：proxy_port 存在时以 --proxy-server 启动，让豆包客户端流量
@@ -898,9 +718,9 @@ fn app_locate_windows(state: &State<AppState>, app: &str) -> AppLocate {
             }
         }
     }
-    if let Some(exe) = registry_app_path(&profile) {
-        return finish_locate(&profile, exe, "registry", None);
-    }
+    // 探测顺序对齐全库原有语义（旧 detect_trae/detect_trae_cn 与切换器 locate.rs
+    // 均为默认路径优先、注册表兜底）：多安装共存时优先取官方默认位置的最新安装，
+    // 注册表残留的过期条目只作兜底，避免选到已卸载/迁移的旧路径
     for c in profile.exe_candidates {
         let expanded = c
             .replace("%LOCALAPPDATA%", &std::env::var("LOCALAPPDATA").unwrap_or_default())
@@ -908,6 +728,9 @@ fn app_locate_windows(state: &State<AppState>, app: &str) -> AppLocate {
         if std::path::Path::new(&expanded).is_file() {
             return finish_locate(&profile, expanded, "default", None);
         }
+    }
+    if let Some(exe) = registry_app_path(&profile) {
+        return finish_locate(&profile, exe, "registry", None);
     }
     if let Some(exe) = process_exe_path(profile.proc_names) {
         return finish_locate(&profile, exe, "process", None);

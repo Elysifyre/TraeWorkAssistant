@@ -129,6 +129,9 @@ interface AppState {
   moveAccount: (userId: string, groupId: string | null) => Promise<void>;
   resetDevice: (userId: string) => Promise<void>;
   switchTo: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') => Promise<void>;
+  /** issue #44：看门狗超时后清空切换/保存进行中状态——解除 spinner/「切换中…」永挂；
+      迟到的 done 事件仍会正常提示结果（onSwitchDone 对 null 幂等） */
+  clearSwitchLocks: () => void;
   /** C1：一键以账号 X 打开豆包（恢复快照后拉起客户端；代理运行中时注入代理） */
   openDoubaoAs: (userId: string, proxyPort?: number) => Promise<void>;
   saveCurrentLogin: (userId: string, targetApp?: 'TraeWork' | 'Trae' | 'Doubao' | 'WorkBuddy' | 'CodeBuddy') => Promise<void>;
@@ -166,6 +169,7 @@ function defaultSettings(): Settings {
     launch_minimized: false,
     silent_checkin: false,
     auto_start_proxy: true,
+    auto_start_api: false,
     tray: true,
     language: 'zh-CN',
     checkin_skip_checked: true,
@@ -387,6 +391,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     const s = get();
     if (!s.proxy.running && s.settings?.auto_start_proxy) {
       void s.startProxy();
+    }
+    // 启动时根据设置自动开启 API 网关（复刻 auto_start_proxy 模式）：
+    // Rust 侧 do_start 对已运行实例返回 Err，此处判重 + 静默兜底，避免与托盘启停竞态时误报
+    if (!s.apiStatus?.running && s.settings?.auto_start_api) {
+      try {
+        const status = await api.apiServer.start();
+        set({ apiStatus: status });
+      } catch {
+        /* 静默失败：状态栏保持未启动，用户可手动启动 */
+      }
     }
   },
 
@@ -762,6 +776,9 @@ export const useAppStore = create<AppState>((set, get) => ({
       get().pushToast('error', `切换失败：${String(err)}`);
     }
   },
+  clearSwitchLocks: () => {
+    set({ switchingTo: null, savingLogin: null });
+  },
   saveCurrentLogin: async (userId, targetApp) => {
     try {
       set({ savingLogin: userId, saveLoginProgress: [] });
@@ -796,9 +813,13 @@ export const useAppStore = create<AppState>((set, get) => ({
       const proxyPort = proxy?.running && proxy.port ? proxy.port : undefined;
       // 切换到目标账号，TRAE 重启后走代理，新 JWT 会被自动捕获
       // skipJwtProbe=true：续期场景目标账号 JWT 本就可能已被服务端吊销，跳过切换前预检
+      // issue #44 遗留项：纳入切换状态机——进度面板与 90s 看门狗均依赖 switchingTo
+      // 非空；终态由 switch-done 事件统一复位（含失败 toast）
+      set({ switchingTo: userId, switchProgress: [] });
       get().pushToast('info', '正在切换账号以捕获新 JWT，请稍候…');
       await api.switchAccount(userId, undefined, true, proxyPort);
     } catch (err) {
+      set({ switchingTo: null });
       get().pushToast('error', `续期失败：${String(err)}`);
     }
   },

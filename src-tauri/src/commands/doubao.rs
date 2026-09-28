@@ -8,7 +8,7 @@
 
 use serde::Serialize;
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 use crate::fs_utils;
 use crate::state::{copy_dir_recursive, AppState};
@@ -795,14 +795,14 @@ pub fn doubao_keepalive_run(app: AppHandle, state: State<AppState>) -> Result<()
     let data_dir = state.data_dir.clone();
     let st2 = state.inner().clone();
     std::thread::spawn(move || {
-        let sink = crate::switcher::TauriSink::new(&app2, "keepalive-progress", &data_dir);
-        let result = crate::switcher::run_action(args, &sink);
-        let (success, raw) = match &result {
-            Ok(line) => (true, line.clone()),
-            Err(line) => (false, line.clone()),
-        };
-        let _ = app2.emit("keepalive-done", serde_json::json!({ "success": success, "raw": raw }));
-        if success {
+        // issue #44：与切换管线对齐——panic 时 keepalive-done 仍会发射，前端不会永久锁在保活中
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let sink = crate::switcher::TauriSink::new(&app2, "keepalive-progress", &data_dir);
+            crate::switcher::run_action(args, &sink)
+        }));
+        let ok = matches!(&result, Ok(Ok(_)));
+        super::switch::finish_action_thread(&app2, "keepalive-done", &data_dir, result, serde_json::Value::Null);
+        if ok {
             // 记录池级保活时间戳 + 运维历史（写入失败不影响保活结果；SQLite 化 P3 经 store）
             let mut pool = load_pool(&st2);
             pool.last_keepalive_at = Some(fs_utils::now_ts());
@@ -1476,14 +1476,13 @@ pub fn doubao_open_as_account(
     let data_dir = state.data_dir.clone();
     // 后台线程执行（含优雅关闭 8s 等待，不阻塞命令返回）
     std::thread::spawn(move || {
-        // 进度复用 switch-progress / switch-done 事件管线（与切换管线完全一致）
-        let sink = crate::switcher::TauriSink::new(&app2, "switch-progress", &data_dir);
-        let result = crate::switcher::run_action(args, &sink);
-        let (success, raw) = match &result {
-            Ok(line) => (true, line.clone()),
-            Err(line) => (false, line.clone()),
-        };
-        let _ = app2.emit("switch-done", serde_json::json!({ "success": success, "raw": raw }));
+        // issue #44：catch_unwind + 统一终态出口——panic 时 switch-done 仍会发射，
+        // 前端不会永久停留在「切换中」（进度复用 switch-progress / switch-done 事件管线）
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let sink = crate::switcher::TauriSink::new(&app2, "switch-progress", &data_dir);
+            crate::switcher::run_action(args, &sink)
+        }));
+        super::switch::finish_action_thread(&app2, "switch-done", &data_dir, result, serde_json::Value::Null);
     });
     Ok(())
 }

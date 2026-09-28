@@ -1,6 +1,14 @@
 use std::io::{BufRead, BufReader, Read};
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
+
+use super::wb_upstream::InterruptibleLines;
+
+/// 上游停滞期间的断连轮询间隔：每 500ms 醒来检查一次客户端是否断连
+/// （sender.is_closed()），避免「断连 + 上游停滞」时死等下一行
+/// （最长 300s 读超时）才释放账号并发槽
+const LINE_POLL: Duration = Duration::from_millis(500);
 
 /// SOLO SSE 单事件
 struct SoloEvent {
@@ -50,9 +58,10 @@ impl SseState {
 }
 
 /// 行源抽象（P1 修复2）：上游已经 wb_upstream::lines_with_first_byte_timeout
-/// 包装（首字节 10s 超时 → 故障转移）产出的行迭代器。迭代器读错误等同 EOF
-/// 终止转换（包装层已把读错误折叠为流结束）
-type LineSrc = Box<dyn Iterator<Item = String> + Send>;
+/// 包装（首字节 10s 超时 → 故障转移）产出的可中断行源。读错误等同 EOF
+/// 终止转换（包装层已把读错误折叠为流结束）；上游停滞期间转换循环可通过
+/// next_timeout 周期性醒来检查客户端断连
+type LineSrc = InterruptibleLines;
 
 /// 处理一行，返回触发的事件（空行时解析并返回）
 fn scan_line(st: &mut SseState, line: &str) -> Option<SoloEvent> {
@@ -146,9 +155,9 @@ fn parse_solo_line(event: &str, data: &str) -> Option<SoloEvent> {
 /// 若上游首个事件即 error（尚未发送任何数据），错误不下发，
 /// 由调用方决定重试（如 4001 改 function）或透传给客户端。
 /// 行源：wb_upstream::lines_with_first_byte_timeout 包装（首字 10s 超时 →
-/// 故障转移）产出的行迭代器
+/// 故障转移）产出的可中断行源
 pub fn stream_convert_lines(
-    lines: Box<dyn Iterator<Item = String> + Send>,
+    lines: InterruptibleLines,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     chat_id: &str,
 ) -> (Option<(i64, String)>, bool, Option<Value>) {
@@ -191,7 +200,19 @@ fn stream_convert_src(
         format!("data: {}\n\n", chunk)
     };
 
-    while let Some(line) = src.next() {
+    loop {
+        // 断连 + 上游停滞：带超时取行，停滞期间每 LINE_POLL 醒来检查客户端
+        // 是否断连（sender.is_closed()），不再死等上游下一行（最长 300s 读超时）
+        let line = match src.next_timeout(LINE_POLL) {
+            Ok(Some(line)) => line,
+            Ok(None) => break, // 流结束（读错误折叠为 EOF）
+            Err(()) => {
+                if sender.is_closed() {
+                    break; // 客户端已断连：退出，释放上游连接与账号并发槽
+                }
+                continue; // 仅停滞未断连：继续等待
+            }
+        };
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
@@ -232,13 +253,18 @@ fn stream_convert_src(
                     }
                     if !delta.is_empty() {
                         let data = write_chunk(Value::Object(delta), "", &pending_usage);
-                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                        // 客户端断连检测：发送失败即退出读循环，释放上游与账号并发槽
+                        if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
+                            break;
+                        }
                         sent_any = true;
                     } else if !sent_any {
                         // 空 delta 的首个 output：上游已开始产出，
                         // 发出仅含 role 的空 chunk 占位，让 sent_any 语义与真实下发一致
                         let data = write_chunk(json!({ "role": "assistant" }), "", &pending_usage);
-                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                        if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
+                            break;
+                        }
                         sent_any = true;
                     }
                 }
@@ -247,7 +273,9 @@ fn stream_convert_src(
                 }
                 "done" | "turn_completion" => {
                     let data = write_chunk(json!({}), &ev.finish_reason, &pending_usage);
-                    let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                    if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
+                        break;
+                    }
                     let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                     saw_done = true;
                     sent_any = true;
@@ -263,10 +291,12 @@ fn stream_convert_src(
                                 "code": ev.error_code.unwrap_or(0),
                             }
                         });
-                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(format!(
+                        if sender.blocking_send(Ok(bytes::Bytes::from(format!(
                             "data: {}\n\n",
                             error_chunk
-                        ))));
+                        )))).is_err() {
+                            break;
+                        }
                         let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                         saw_done = true;
                     }
@@ -290,7 +320,7 @@ fn stream_convert_src(
 /// 流式转换：SOLO SSE → OpenAI legacy text completion SSE（/v1/completions，T9）
 /// delta.content → choices[].text 块；reasoning_content 无对应字段，跳过
 pub fn stream_convert_text_lines(
-    lines: Box<dyn Iterator<Item = String> + Send>,
+    lines: InterruptibleLines,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     completion_id: &str,
     model: &str,
@@ -328,13 +358,26 @@ fn stream_convert_text_src(
         format!("data: {}\n\n", chunk)
     };
 
-    while let Some(line) = src.next() {
+    loop {
+        // 断连 + 上游停滞：同 stream_convert_src，停滞期间周期性检查断连
+        let line = match src.next_timeout(LINE_POLL) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(()) => {
+                if sender.is_closed() {
+                    break;
+                }
+                continue;
+            }
+        };
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
                     if !ev.response.is_empty() {
                         let data = write_chunk(&ev.response, "", &pending_usage);
-                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                        if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
+                            break;
+                        }
                         sent_any = true;
                     }
                 }
@@ -343,7 +386,9 @@ fn stream_convert_text_src(
                 }
                 "done" | "turn_completion" => {
                     let data = write_chunk("", &ev.finish_reason, &pending_usage);
-                    let _ = sender.blocking_send(Ok(bytes::Bytes::from(data)));
+                    if sender.blocking_send(Ok(bytes::Bytes::from(data))).is_err() {
+                        break;
+                    }
                     let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                     saw_done = true;
                     sent_any = true;
@@ -359,10 +404,12 @@ fn stream_convert_text_src(
                                 "code": ev.error_code.unwrap_or(0),
                             }
                         });
-                        let _ = sender.blocking_send(Ok(bytes::Bytes::from(format!(
+                        if sender.blocking_send(Ok(bytes::Bytes::from(format!(
                             "data: {}\n\n",
                             error_chunk
-                        ))));
+                        )))).is_err() {
+                            break;
+                        }
                         let _ = sender.blocking_send(Ok(bytes::Bytes::from("data: [DONE]\n\n")));
                         saw_done = true;
                     }
@@ -531,7 +578,7 @@ fn anthropic_event(name: &str, data: &Value) -> String {
 
 /// 流式转换：SOLO SSE → Anthropic Messages SSE（/v1/messages）
 pub fn stream_convert_anthropic_lines(
-    lines: Box<dyn Iterator<Item = String> + Send>,
+    lines: InterruptibleLines,
     sender: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
     msg_id: &str,
     model: &str,
@@ -558,10 +605,14 @@ fn stream_convert_anthropic_src(
     let mut finish_reason = String::new();
     let mut saw_done = false;
     let mut error_info: Option<(i64, String)> = None;
+    // 客户端断连标志：宏内发送失败置位，主循环检测退出（宏也被循环外收尾调用，不能直接 break）
+    let mut disconnected = false;
 
     macro_rules! send {
         ($s:expr) => {
-            let _ = sender.blocking_send(Ok(bytes::Bytes::from($s)));
+            if sender.blocking_send(Ok(bytes::Bytes::from($s))).is_err() {
+                disconnected = true;
+            }
         };
     }
 
@@ -676,7 +727,22 @@ fn stream_convert_anthropic_src(
         }};
     }
 
-    while let Some(line) = src.next() {
+    loop {
+        // 客户端断连：立即停止读上游，释放连接与账号并发槽
+        if disconnected {
+            break;
+        }
+        // 断连 + 上游停滞：带超时取行，停滞期间周期性检查断连（同上两个转换）
+        let line = match src.next_timeout(LINE_POLL) {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(()) => {
+                if sender.is_closed() {
+                    break;
+                }
+                continue;
+            }
+        };
         if let Some(ev) = scan_line(&mut st, &line.trim_end()) {
             match ev.event.as_str() {
                 "output" | "thought" => {
@@ -794,7 +860,7 @@ fn stream_convert_anthropic_src(
         }
     }
 
-    if !saw_done {
+    if !saw_done && !disconnected {
         if message_started || !tools.is_empty() {
             // 上游未发 done 即断流：把已收到的内容按正常收尾发出，避免客户端挂起
             finish_stream!();
@@ -1001,7 +1067,7 @@ mod tests {
         let input = "event: output\ndata: {\"response\":\"hello\"}\n\n\
                      event: error\ndata: {\"code\":500,\"message\":\"boom\"}\n\n";
         let (error_info, sent_any, _) = stream_convert_anthropic_lines(
-            Box::new(input.lines().map(str::to_string)),
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "msg_t",
             "m",
@@ -1030,7 +1096,7 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
         let input = "event: error\ndata: {\"code\":4001,\"message\":\"model config is empty\"}\n\n";
         let (error_info, sent_any, _) = stream_convert_anthropic_lines(
-            Box::new(input.lines().map(str::to_string)),
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string))),
             tx,
             "msg_t",
             "m",
@@ -1049,11 +1115,12 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
         let cursor_lines =
             std::io::Cursor::new(input).lines().map(|l| l.expect("读行失败"));
-        let (e1, s1, _) = stream_convert_lines(Box::new(cursor_lines), tx, "c1");
+        let (e1, s1, _) =
+            stream_convert_lines(InterruptibleLines::from_iterator(Box::new(cursor_lines)), tx, "c1");
         // 内存切分形态（首字超时包装产物形态）
         let (tx2, rx2) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
-        let lines: Box<dyn Iterator<Item = String> + Send> =
-            Box::new(input.lines().map(str::to_string));
+        let lines: InterruptibleLines =
+            InterruptibleLines::from_iterator(Box::new(input.lines().map(str::to_string)));
         let (e2, s2, _) = stream_convert_lines(lines, tx2, "c1");
         assert_eq!(e1, e2);
         assert_eq!(s1, s2);

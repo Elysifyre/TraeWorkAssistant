@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::path::PathBuf;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
@@ -139,15 +139,17 @@ pub fn profile_backup(
     let data_dir = state.data_dir.clone();
     // 后台线程执行（含优雅关闭等待，不阻塞命令返回；与原 stdout 读线程同语义）
     std::thread::spawn(move || {
-        let sink = TauriSink::new(&app2, "profile-progress", &data_dir);
-        let result = crate::switcher::run_action(args, &sink);
-        let (success, raw) = match &result {
-            Ok(line) => (true, line.clone()),
-            Err(line) => (false, line.clone()),
-        };
-        let _ = app2.emit(
+        // issue #44：与切换管线对齐——panic 时 profile-done 仍会发射，前端不会永久锁在备份中
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let sink = TauriSink::new(&app2, "profile-progress", &data_dir);
+            crate::switcher::run_action(args, &sink)
+        }));
+        super::switch::finish_action_thread(
+            &app2,
             "profile-done",
-            serde_json::json!({ "success": success, "raw": raw, "action": "backup" }),
+            &data_dir,
+            result,
+            serde_json::json!({ "action": "backup" }),
         );
     });
     Ok(())
@@ -187,15 +189,17 @@ pub fn profile_restore(
     let app2 = app.clone();
     let data_dir = state.data_dir.clone();
     std::thread::spawn(move || {
-        let sink = TauriSink::new(&app2, "profile-progress", &data_dir);
-        let result = crate::switcher::run_action(args, &sink);
-        let (success, raw) = match &result {
-            Ok(line) => (true, line.clone()),
-            Err(line) => (false, line.clone()),
-        };
-        let _ = app2.emit(
+        // issue #44：与切换管线对齐——panic 时 profile-done 仍会发射，前端不会永久锁在恢复中
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let sink = TauriSink::new(&app2, "profile-progress", &data_dir);
+            crate::switcher::run_action(args, &sink)
+        }));
+        super::switch::finish_action_thread(
+            &app2,
             "profile-done",
-            serde_json::json!({ "success": success, "raw": raw, "action": "restore" }),
+            &data_dir,
+            result,
+            serde_json::json!({ "action": "restore" }),
         );
     });
     Ok(())

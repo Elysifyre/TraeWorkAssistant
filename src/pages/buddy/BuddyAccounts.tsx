@@ -26,6 +26,7 @@ import {
 import { useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import PageHeader from '../../components/PageHeader';
+import SwitchProgressPanel from '../../components/SwitchProgressPanel';
 import { Badge, EmptyState, Modal, Spinner } from '../../components/ui';
 import { BuddyHelpModal } from './HelpModal';
 import { GroupSelect } from '../accounts/GroupSelect';
@@ -91,6 +92,7 @@ type ChatMetaEntry = [string, { backed: boolean; files?: number; backed_at?: str
 
 export default function BuddyAccounts() {
   const pushToast = useAppStore((s) => s.pushToast);
+  const clearSwitchLocks = useAppStore((s) => s.clearSwitchLocks);
   const switchTo = useAppStore((s) => s.switchTo);
   const switchingTo = useAppStore((s) => s.switchingTo);
   const saveCurrentLogin = useAppStore((s) => s.saveCurrentLogin);
@@ -325,8 +327,9 @@ export default function BuddyAccounts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [oauthOpen, oauthBusy]);
 
-  // 切换/保存登录态看门狗：switch-done / save-login-done 事件异常缺失时，90s 后本地解除
-  // 行内按钮互斥（store 状态只读，此处仅页面级兜底；事件迟到仍会正常提示结果）
+  // 切换/保存登录态看门狗：switch-done / save-login-done 事件异常缺失时，90s 后解除
+  // 行内按钮互斥并清空 store 进行中状态（issue #44：仅页面级解锁会让 spinner 永挂；
+  // 事件迟到仍会正常提示结果）
   useEffect(() => {
     if (!switchingTo && !savingLogin) {
       setLockTimedOut(false);
@@ -335,6 +338,7 @@ export default function BuddyAccounts() {
     setLockTimedOut(false);
     const timer = setTimeout(() => {
       setLockTimedOut(true);
+      clearSwitchLocks();
       pushToast('warn', '切换/保存超过 90 秒未收到完成事件，已解除按钮锁定；结果请以日志与列表状态为准');
     }, 90_000);
     return () => clearTimeout(timer);
@@ -779,6 +783,9 @@ export default function BuddyAccounts() {
           </>
         }
       />
+
+      {/* 切换/保存进度面板（issue #44 遗留项，位置对齐 Trae/豆包页：PageHeader 之后） */}
+      <SwitchProgressPanel />
 
       {/* 分组过滤 chips（对齐 Trae 账号管理） */}
       {accounts.length > 0 && (

@@ -65,7 +65,17 @@ where
     std::thread::spawn(move || {
         let _guard = round;
         f(&app, &state);
-        let _ = app.emit("wb-checkin-progress", "{\"type\":\"exit\",\"ok\":true}");
+        // 终态事件（前端据 "type":"exit" 复位运行态）：emit 失败落日志（issue #44 遗留项）。
+        // 注意：wb-checkin-progress 前端契约是 NDJSON **字符串**（listen<string> 后
+        // JSON.parse）——payload 必须序列化为 String，传对象会破坏 parseLine 导致
+        // exit 事件被静默丢弃、前端运行态永挂
+        let line = serde_json::json!({ "type": "exit", "ok": true }).to_string();
+        crate::events::emit_logged(
+            &app,
+            "wb-checkin-progress",
+            serde_json::Value::String(line),
+            Some(state.data_dir.as_path()),
+        );
     });
     Ok(())
 }

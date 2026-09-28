@@ -3,7 +3,7 @@
 //! `switcher::run_action` 进程内直调 + `TauriSink` 一步到位 emit 事件，
 //! 终态 `*-done {success, raw}` 由命令层依据返回值发射（前端契约不变）。
 
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, State};
 
 use crate::fs_utils;
 use crate::state::AppState;
@@ -11,8 +11,14 @@ use crate::switcher::{Action, RunArgs, TauriSink, TargetApp};
 
 use super::workbuddy::BuddyApp;
 
+/// emit 失败兜底（issue #44）：委托 events::emit_logged（失败落日志，不再静默吞掉——
+/// 前端收不到 *-done 终态事件时 switchingTo 永久非空，用户感知为「一直显示切换中」）。
+fn emit_or_log(app: &AppHandle, event: &str, payload: serde_json::Value, data_dir: &std::path::Path) {
+    crate::events::emit_logged(app, event, payload, Some(data_dir));
+}
+
 /// switch-progress 事件单行 NDJSON（与 switcher::step_line 字段序/语义一致）
-fn emit_switch_step(app: &AppHandle, stage: &str, status: &str, message: &str) {
+fn emit_switch_step(app: &AppHandle, data_dir: &std::path::Path, stage: &str, status: &str, message: &str) {
     let line = serde_json::json!({
         "stage": stage,
         "status": status,
@@ -20,7 +26,35 @@ fn emit_switch_step(app: &AppHandle, stage: &str, status: &str, message: &str) {
         "time": fs_utils::now_ts(),
     })
     .to_string();
-    let _ = app.emit("switch-progress", line);
+    emit_or_log(app, "switch-progress", serde_json::Value::String(line), data_dir);
+}
+
+/// 后台线程统一终态出口（issue #44）：run_action panic（如文件操作/数据库异常
+/// unwrap）时后台线程直接死亡、*-done 事件永不发射——switchingTo 永久非空，
+/// 前端「一直显示切换中」。catch_unwind 捕获后仍发射失败终态；emit 失败落日志。
+/// `extra_fields`：附加字段（如 profile-done 的 action），为对象时逐字段并入 payload。
+pub(crate) fn finish_action_thread(
+    app: &AppHandle,
+    event_done: &'static str,
+    data_dir: &std::path::Path,
+    result: std::thread::Result<Result<String, String>>,
+    extra_fields: serde_json::Value,
+) {
+    let (success, raw) = match result {
+        Ok(Ok(line)) => (true, line),
+        Ok(Err(line)) => (false, line),
+        Err(_) => (
+            false,
+            "[fatal] 切换流程内部异常终止（后台线程 panic），请重试；若持续复现请携带 logs/switcher.log 反馈".to_string(),
+        ),
+    };
+    let mut payload = serde_json::json!({ "success": success, "raw": raw });
+    if let (Some(obj), Some(extra)) = (payload.as_object_mut(), extra_fields.as_object()) {
+        for (k, v) in extra {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
+    emit_or_log(app, event_done, payload, data_dir);
 }
 
 /// F-74：判定 Buddy（WorkBuddy/CodeBuddy）当前的登录账号 id（会话迁移的源账号）。
@@ -88,19 +122,23 @@ fn run_in_background(
 ) {
     std::thread::spawn(move || {
         let data_dir = args.data_dir.clone();
-        if let Some(pre) = pre {
-            pre(&app);
-        }
-        let sink = TauriSink::new(&app, event_progress, &data_dir);
-        let result = crate::switcher::run_action(args, &sink);
-        let (success, raw) = match &result {
-            Ok(line) => (true, line.clone()),
-            Err(line) => (false, line.clone()),
-        };
-        let _ = app.emit(event_done, serde_json::json!({ "success": success, "raw": raw }));
-        if success {
+        // issue #44：catch_unwind 包裹全部前置作业与主流程——任何 panic 都保证
+        // *-done 终态事件仍被发射，前端不会永久停留在「切换中」
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(pre) = pre {
+                pre(&app);
+            }
+            let sink = TauriSink::new(&app, event_progress, &data_dir);
+            crate::switcher::run_action(args, &sink)
+        }));
+        let ok = matches!(&result, Ok(Ok(_)));
+        finish_action_thread(&app, event_done, &data_dir, result, serde_json::Value::Null);
+        if ok {
             if let Some(cb) = on_success {
-                cb(&app, &data_dir);
+                // 回调自身 panic 不影响已发出的终态事件，仅记录
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    cb(&app, &data_dir);
+                }));
             }
         }
     });
@@ -162,7 +200,7 @@ pub fn switch_account(
                 "message": dead_msg,
             })
             .to_string();
-            let _ = app.emit("switch-progress", &warn_line);
+            emit_or_log(&app, "switch-progress", serde_json::Value::String(warn_line), &state.data_dir);
         }
     }
 
@@ -229,15 +267,17 @@ pub fn switch_account(
                 Some(Box::new(move |app: &AppHandle| {
                     emit_switch_step(
                         app,
+                        &data_dir,
                         "migrate",
                         "running",
                         &format!("正在迁移 {label} 会话到目标账号（自动备份 + 新 id 复制）"),
                     );
                     match crate::commands::workbuddy::backup_chats(&data_dir, buddy_app, &src).map(|(n, _)| n) {
-                        Ok(n) => emit_switch_step(app, "migrate", "ok", &format!("当前账号会话已备份（{n} 个文件）")),
+                        Ok(n) => emit_switch_step(app, &data_dir, "migrate", "ok", &format!("当前账号会话已备份（{n} 个文件）")),
                         Err(e) => {
                             emit_switch_step(
                                 app,
+                                &data_dir,
                                 "migrate",
                                 "warn",
                                 &format!("会话备份失败（已跳过迁移，切换继续）: {e}"),
@@ -248,6 +288,7 @@ pub fn switch_account(
                     match crate::commands::workbuddy::copy_chats(&data_dir, buddy_app, &src, &uid) {
                         Ok(v) => emit_switch_step(
                             app,
+                            &data_dir,
                             "migrate",
                             "ok",
                             &format!(
@@ -259,6 +300,7 @@ pub fn switch_account(
                         ),
                         Err(e) => emit_switch_step(
                             app,
+                            &data_dir,
                             "migrate",
                             "warn",
                             &format!("会话迁移失败（不影响登录态切换，可稍后手动「复制会话」）: {e}"),

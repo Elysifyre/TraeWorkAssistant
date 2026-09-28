@@ -18,6 +18,7 @@ import {
   Download,
 } from 'lucide-react';
 import PageHeader from '../../components/PageHeader';
+import SwitchProgressPanel from '../../components/SwitchProgressPanel';
 import { Badge, Modal } from '../../components/ui';
 import { api } from '../../lib/tauri';
 import { withMinDelay } from '../../lib/delay';
@@ -50,10 +51,9 @@ export default function DoubaoAccounts() {
   const switchTo = useAppStore((s) => s.switchTo);
   const openDoubaoAs = useAppStore((s) => s.openDoubaoAs);
   const saveCurrentLogin = useAppStore((s) => s.saveCurrentLogin);
+  const clearSwitchLocks = useAppStore((s) => s.clearSwitchLocks);
   const switchingTo = useAppStore((s) => s.switchingTo);
-  const switchProgress = useAppStore((s) => s.switchProgress);
   const savingLogin = useAppStore((s) => s.savingLogin);
-  const saveLoginProgress = useAppStore((s) => s.saveLoginProgress);
   const proxy = useAppStore((s) => s.proxy);
 
   const [accounts, setAccounts] = useState<DoubaoAccountView[]>([]);
@@ -66,6 +66,9 @@ export default function DoubaoAccounts() {
   const [renewRunning, setRenewRunning] = useState(false);
   const [renewSummary, setRenewSummary] = useState<DoubaoRenewSummary | null>(null);
   const [keepaliveRunning, setKeepaliveRunning] = useState(false);
+  // 切换/保存 90s 看门狗（对齐 Accounts/BuddyAccounts，issue #44 遗留项）：
+  // done 事件异常缺失时解除按钮互斥并清空 store 进行中状态
+  const [lockTimedOut, setLockTimedOut] = useState(false);
   const [keepaliveProgress, setKeepaliveProgress] = useState<string[]>([]);
   const [quotaRunningFor, setQuotaRunningFor] = useState<string | null>(null);
   const [quotaResult, setQuotaResult] = useState<{ userId: string; result: DoubaoQuotaResult } | null>(null);
@@ -423,7 +426,37 @@ export default function DoubaoAccounts() {
     }
   };
 
-  const anyBusy = renewRunning || keepaliveRunning || !!switchingTo || !!savingLogin;
+  // 看门狗 effect：切换/保存 90s（对齐 Trae/Buddy 页）+ 保活 60s 本地兜底
+  //（保活正常约 12 秒；keepalive-done 终态已由后端 catch_unwind 保证，此处仅防御）
+  useEffect(() => {
+    if (!switchingTo && !savingLogin) {
+      setLockTimedOut(false);
+      return;
+    }
+    setLockTimedOut(false);
+    const timer = setTimeout(() => {
+      setLockTimedOut(true);
+      clearSwitchLocks();
+      pushToast('warn', '切换/保存超过 90 秒未收到完成事件，已解除按钮锁定；结果请以日志与列表状态为准');
+    }, 90_000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [switchingTo, savingLogin]);
+
+  useEffect(() => {
+    if (!keepaliveRunning) return;
+    const timer = setTimeout(() => {
+      setKeepaliveRunning(false);
+      pushToast('warn', '保活超过 60 秒未收到完成事件，已解除按钮锁定；结果请以日志与列表状态为准');
+    }, 60_000);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [keepaliveRunning]);
+
+  const anyBusy =
+    renewRunning ||
+    keepaliveRunning ||
+    ((!!switchingTo || !!savingLogin) && !lockTimedOut);
 
   /** 查询会员额度（需该账号已有会话凭证；成功后结果会缓存进账号池，徽标/悬停提示随之更新） */
   const doFetchQuota = async (a: DoubaoAccountView) => {
@@ -614,21 +647,8 @@ export default function DoubaoAccounts() {
         }
       />
 
-      {/* 切换 / 保存进度（复用全局 NDJSON 事件管线） */}
-      {(switchingTo || savingLogin) && (
-        <div className="mt-5 rounded-lg border border-brand-300 bg-brand-50 p-3 dark:border-brand-700 dark:bg-brand-900/20">
-          <div className="mb-1 text-xs font-medium text-brand-700 dark:text-brand-300">
-            {switchingTo ? `正在切换至 ${switchingTo}…` : `正在保存 ${savingLogin} 的登录态…`}
-          </div>
-          <div className="max-h-40 space-y-0.5 overflow-auto font-mono text-xs text-brand-600 dark:text-brand-400">
-            {(switchingTo ? switchProgress : saveLoginProgress).length === 0 ? (
-              <div>等待中...</div>
-            ) : (
-              (switchingTo ? switchProgress : saveLoginProgress).map((line, i) => <div key={i}>{line}</div>)
-            )}
-          </div>
-        </div>
-      )}
+      {/* 切换 / 保存进度（复用全局 NDJSON 事件管线，与 Trae/Buddy 页共用组件） */}
+      <SwitchProgressPanel />
 
       {/* 保活进度（P3，NDJSON 事件） */}
       {keepaliveRunning && (

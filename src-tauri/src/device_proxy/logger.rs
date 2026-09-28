@@ -220,7 +220,8 @@ impl ProxyLog {
                         let _ = app.emit("proxy-log", &raw);
                         if let Some(uid) = extract_uid(&raw) {
                             captured.fetch_add(1, Ordering::Relaxed);
-                            let _ = app.emit("account-captured", &uid);
+                            // 结果型事件（前端弹 toast + 刷新账号池）：emit 失败落日志（issue #44 遗留项）
+                            crate::events::emit_logged(app, "account-captured", serde_json::Value::String(uid.clone()), None);
                         }
                     }
                 }

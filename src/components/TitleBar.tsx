@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { Minus, Square, X } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import { Copy, Minus, Square, X } from 'lucide-react';
 import { useAppStore } from '../store';
 import { Modal } from './ui';
 import { APP_NAME } from '../lib/about';
@@ -36,7 +37,30 @@ export function BrandMark({ size = 24, iconSize = 14 }: { size?: number; iconSiz
 
 export default function TitleBar() {
   const [showCloseConfirm, setShowCloseConfirm] = useState(false);
+  const [maximized, setMaximized] = useState(false);
   const proxyRunning = useAppStore((s) => s.proxy.running);
+
+  // issue #46：跟踪窗口真实最大化状态——toggleMaximize 在无边框窗口 hide/show 后
+  // 可能与内部状态失同步（视觉已还原但 isMaximized() 仍为 true，点最大化无反应），
+  // 改为显式判断 + 图标随状态切换
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      setMaximized(await win.isMaximized());
+      unlisten = await win.onResized(async () => {
+        setMaximized(await win.isMaximized());
+      });
+    })();
+    return () => unlisten?.();
+  }, []);
+
+  const toggleMaximize = async () => {
+    if (await win.isMaximized()) {
+      await win.unmaximize();
+    } else {
+      await win.maximize();
+    }
+  };
 
   return (
     <>
@@ -53,7 +77,7 @@ export default function TitleBar() {
           {/* onMouseDown 阻止冒泡：否则事件冒泡到外层 data-tauri-drag-region，Tauri 会启动窗口拖拽而吞掉 click，导致最小/最大化/关闭无响应 */}
           <button
             onMouseDown={(e) => e.stopPropagation()}
-            onClick={() => void win.hide()}
+            onClick={() => void invoke('minimize_to_tray')}
             className="flex h-8 w-10 items-center justify-center text-slate-500 transition hover:bg-slate-200/70 active:scale-90 dark:text-zinc-400 dark:hover:bg-zinc-800"
             aria-label="最小化"
             title="最小化到托盘"
@@ -62,11 +86,12 @@ export default function TitleBar() {
           </button>
           <button
             onMouseDown={(e) => e.stopPropagation()}
-            onClick={() => void win.toggleMaximize()}
+            onClick={() => void toggleMaximize()}
             className="flex h-8 w-10 items-center justify-center text-slate-500 transition hover:bg-slate-200/70 active:scale-90 dark:text-zinc-400 dark:hover:bg-zinc-800"
-            aria-label="最大化"
+            aria-label={maximized ? '还原' : '最大化'}
+            title={maximized ? '向下还原' : '最大化'}
           >
-            <Square size={13} />
+            {maximized ? <Copy size={13} /> : <Square size={13} />}
           </button>
           <button
             onMouseDown={(e) => e.stopPropagation()}
