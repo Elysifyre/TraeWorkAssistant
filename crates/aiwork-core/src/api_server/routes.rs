@@ -16,7 +16,7 @@ use super::efforts;
 use super::retry::{retry_plan, RetryAction};
 use super::sse;
 use super::unified_catalog;
-use super::usage::{extract_tokens, KeyId};
+use super::usage::{extract_tokens, today_key, UsageBucket, KeyId};
 use super::wb_catalog;
 use super::wb_model_route;
 use super::wb_route;
@@ -419,6 +419,23 @@ pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
     let last_err = safe_lock(&state.last_error).clone();
     let wb_enabled = state.wb_enabled.load(std::sync::atomic::Ordering::Relaxed);
     let wb_available = wb_pool.iter().filter(|p| !p.disabled && !p.cooling).count();
+    let wb_cooling = wb_pool.iter().filter(|p| p.cooling).count();
+    let wb_disabled = wb_pool.iter().filter(|p| p.disabled).count();
+    let wb_total_credits: f64 = wb_pool.iter().filter_map(|p| p.credits).sum();
+
+    // 今日 token 用量（Trae/WB/Custom 三池合计，读内存用量快照，免磁盘 IO）
+    let today = today_key();
+    let mut prompt_tokens: u64 = 0;
+    let mut completion_tokens: u64 = 0;
+    {
+        let usage = safe_lock(&state.usage);
+        for b in [UsageBucket::Trae, UsageBucket::Wb, UsageBucket::Custom] {
+            if let Some(s) = usage.day_stats(b, &today) {
+                prompt_tokens += s.prompt_tokens;
+                completion_tokens += s.completion_tokens;
+            }
+        }
+    }
 
     Json(json!({
         "status": "ok",
@@ -426,6 +443,10 @@ pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
         "total_requests": total,
         "active_uid": active,
         "last_error": last_err,
+        "tokens_today": {
+            "prompt": prompt_tokens,
+            "completion": completion_tokens,
+        },
         "pool": {
             "total_accounts": pool.len(),
             "available": available,
@@ -437,6 +458,9 @@ pub async fn health(State(state): State<Arc<ApiSharedState>>) -> impl IntoRespon
             "enabled": wb_enabled,
             "total_accounts": wb_pool.len(),
             "available": wb_available,
+            "cooling": wb_cooling,
+            "disabled": wb_disabled,
+            "total_credits": (wb_total_credits * 100.0).round() / 100.0,
         }
     }))
 }

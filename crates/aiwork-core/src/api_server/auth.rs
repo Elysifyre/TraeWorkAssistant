@@ -24,8 +24,9 @@ pub async fn bearer_auth(
     mut request: Request,
     next: Next,
 ) -> Response {
-    // 网关状态页免鉴权：页面为静态 HTML，无账号/用量数据；
-    // 页面内账号明细与模型目录由浏览器另行请求鉴权端点获得
+    // 网关状态页免鉴权：页面为静态 HTML，/health 仅输出聚合探活级汇总
+    // （池计数 / 通用积分合计 / 今日 token 三池合计，无账号级明细）；
+    // 账号明细与模型目录由浏览器另行请求鉴权端点获得
     if request.uri().path() == "/gw-status" || request.uri().path() == "/health" {
         return next.run(request).await;
     }
