@@ -109,8 +109,9 @@ fn spawn_persistence_flusher(state: Arc<ApiSharedState>) {
 /// 网关路由（公开：server 单体把本 router 与管理面/静态托管 merge 后单端口服务）
 pub fn build_router(state: Arc<ApiSharedState>) -> Router {
     Router::new()
-        // 根路径 Web 状态页（浏览器直访；免鉴权见 auth::bearer_auth）
-        .route("/", get(routes::status_page))
+        // 网关 Web 状态页（/gw-status，浏览器直访；免鉴权见 auth::bearer_auth）。
+        // 根路径 / 不在此注册：落入静态托管 fallback（SPA → 登录页/管理面）
+        .route("/gw-status", get(routes::status_page))
         .route("/health", get(routes::health))
         .route("/healthz", get(routes::healthz))
         .route("/status", get(routes::status))

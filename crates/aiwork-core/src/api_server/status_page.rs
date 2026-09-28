@@ -1,15 +1,16 @@
-//! 网关 Web 状态页（根路径 `/`）：单文件内嵌 HTML，浏览器直访 `http://<host>:7864/`
-//! 即可查看网关运行状态，替代此前根路径 404。
+//! 网关 Web 状态页（`/gw-status`）：单文件内嵌 HTML，浏览器直访
+//! `http://<host>:7864/gw-status` 即可查看网关运行状态。
+//! 根路径 `/` 保留给管理面（SPA → 登录页），状态页独立成路径。
 //!
 //! 设计约束：
-//! - 无前端构建依赖：HTML/CSS/JS 以常量内嵌本模块，`GET /` 直接返回，不引入
-//!   静态文件服务与资产目录（桌面版数据目录结构保持不变）
+//! - 无前端构建依赖：HTML/CSS/JS 以常量内嵌本模块，`GET /gw-status` 直接返回，
+//!   不引入静态文件服务与资产目录（桌面版数据目录结构保持不变）
 //! - 数据源全部复用既有端点：`/health`（免鉴权，探活语义）+ `/status`、
 //!   `/v1/models`（鉴权语义不变）；页面不新增任何后端路由与数据面
-//! - 鉴权策略零变化：`/` 与 `/health` 同等免鉴权（仅展示探活级汇总，
+//! - 鉴权策略零变化：`/gw-status` 与 `/health` 同等免鉴权（仅展示探活级汇总，
 //!   账号明细/模型目录仍需 API Key，浏览器无 Key 时对应区块提示输入）
 
-/// 根路径状态页（单文件，无外部资源引用，CSP 友好）
+/// 网关状态页（单文件，无外部资源引用，CSP 友好）
 pub const STATUS_PAGE_HTML: &str = r#"<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -58,7 +59,7 @@ th { color:var(--mut); font-weight:500; }
 </head>
 <body>
 <h1><span class="dot" id="dot"></span>API 网关状态</h1>
-<div class="sub">AI Work 助手 · 数据每 5 秒自动刷新 · 账号明细与模型目录需 API Key（仅本机存储，不做任何外发）</div>
+<div class="sub">AI Work 助手 · 数据每 5 秒自动刷新 · 账号明细与模型目录需 API Key（仅本机存储，不做任何外发）· <a href="/" style="color:var(--acc)">管理面入口 /</a></div>
 
 <div id="keybox">
   <input id="apikey" type="password" placeholder="可选：填入 API Key 查看账号明细 / 模型目录（Bearer）">

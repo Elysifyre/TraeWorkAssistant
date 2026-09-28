@@ -89,6 +89,18 @@ export default function Login() {
             {busy ? '登录中…' : '登录'}
           </button>
         </form>
+
+        <p className="mt-4 text-center text-xs text-slate-400">
+          网关状态：
+          <a
+            href="/gw-status"
+            target="_blank"
+            rel="noreferrer"
+            className="font-mono text-sky-500 transition hover:text-sky-600"
+          >
+            /gw-status
+          </a>
+        </p>
       </div>
     </div>
   );
