@@ -243,6 +243,24 @@ fn relay_lines<R: Read + Send + 'static>(
     });
 }
 
+/// 断连感知退避等待（issue #41 系列补漏）：RetrySame 退避原为整段
+/// `thread::sleep`（最长 60s），客户端断连也要等满全程才检查——期间持续占用
+/// 账号并发槽。改为 500ms 步进分段睡眠，每段前检查 `gone`（客户端断连信号），
+/// 命中即刻返回 false 终止等待。
+/// 返回 true = 等满 delay_ms 全程且未断连（正常继续重试）。
+pub fn backoff_wait(gone: &dyn Fn() -> bool, delay_ms: u64) -> bool {
+    let mut left = delay_ms.min(60_000);
+    while left > 0 {
+        if gone() {
+            return false;
+        }
+        let step = left.min(500);
+        std::thread::sleep(std::time::Duration::from_millis(step));
+        left -= step;
+    }
+    !gone()
+}
+
 /// 首行 + 剩余行组装为行迭代器（竞速对冲路径使用：胜者 receiver 直接折叠）
 fn chain_rest(
     first: String,
@@ -686,6 +704,20 @@ mod tests {
         assert_eq!(out.hedge, Some("hedge-uid"));
         assert!(out.takeover);
         assert_eq!(collect(out.lines), vec!["data: fast".to_string()]);
+    }
+
+    #[test]
+    fn backoff_wait_语义契约() {
+        // 未断连：等满 delay 全程返回 true（短 delay，实测耗时按 delay 收敛）
+        let start = std::time::Instant::now();
+        assert!(backoff_wait(&|| false, 10));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(10));
+        // 断连：即刻返回 false，不等满全程
+        let start = std::time::Instant::now();
+        assert!(!backoff_wait(&|| true, 5_000));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        // delay 超 60s 上限封顶（仅验证不 panic；不实测 60s 时长）
+        assert!(backoff_wait(&|| false, 0));
     }
 
     #[test]

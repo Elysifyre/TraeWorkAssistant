@@ -1448,9 +1448,8 @@ fn stream_chat(state: Arc<ApiSharedState>, body_vec: Vec<u8>, model: String, str
                             RetryAction::RetrySame { delay_ms } => {
                                 // 同账号重试：不 note_error 不冷却
                                 same_attempt += 1;
-                                std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
-                                // 断连检测：重试等待期间客户端离开则终止
-                                if tx.is_closed() {
+                                // 断连感知退避：分段睡眠中检测客户端离开即刻终止
+                                if !super::wb_upstream::backoff_wait(&|| tx.is_closed(), delay_ms) {
                                     return;
                                 }
                                 continue;

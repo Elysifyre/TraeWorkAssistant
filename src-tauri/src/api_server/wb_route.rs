@@ -610,9 +610,8 @@ fn run_wb_stream(
                     match retry_plan(status, &resp_body, same_attempt, retry_after) {
                         RetryAction::RetrySame { delay_ms } => {
                             same_attempt += 1;
-                            std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
-                            // 断连检测：重试等待期间客户端离开则终止，不再占用该账号并发槽
-                            if tx.is_closed() {
+                            // 断连感知退避：分段睡眠中检测客户端离开即刻终止，不再占用该账号并发槽
+                            if !wb_upstream::backoff_wait(&|| tx.is_closed(), delay_ms) {
                                 return;
                             }
                             continue;
