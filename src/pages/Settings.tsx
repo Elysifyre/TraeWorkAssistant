@@ -248,7 +248,7 @@ export default function Settings() {
 
           <h3 className="mb-1 font-medium">应用环境</h3>
           <p className="mb-3 text-xs text-slate-400">
-            两个 Trae 应用的安装路径，用于「打开应用」与「切换账号」时定位 exe；留空将自动探测。
+            两个 Trae 应用的安装路径，用于「打开应用」与「切换账号」时定位客户端；留空将自动探测。
           </p>
           <div className="space-y-3 text-sm">
             <div>
@@ -258,7 +258,11 @@ export default function Settings() {
                   type="text"
                   value={form.trae_path ?? ''}
                   onChange={(e) => update('trae_path', e.target.value.trim() || null)}
-                  placeholder="默认 C:\Users\你\AppData\Local\Programs\TRAE SOLO CN\TRAE SOLO CN.exe"
+                  placeholder={
+                    platform === 'macos'
+                      ? '默认 /Applications/TRAE SOLO CN.app'
+                      : '默认 C:\\Users\\你\\AppData\\Local\\Programs\\TRAE SOLO CN\\TRAE SOLO CN.exe'
+                  }
                   className="input flex-1"
                 />
                 <button onClick={detectTrae} disabled={detecting} className="btn-outline shrink-0">
@@ -266,7 +270,9 @@ export default function Settings() {
                 </button>
               </div>
               <p className="mt-1 text-xs text-slate-400">
-                TRAE SOLO CN（Trae Work）的 exe 路径，自定义安装目录时需填写。
+                {platform === 'macos'
+                  ? 'TRAE SOLO CN（Trae Work）的 .app 应用路径，安装到非标准目录时需填写。'
+                  : 'TRAE SOLO CN（Trae Work）的 exe 路径，自定义安装目录时需填写。'}
               </p>
             </div>
             <div>
@@ -276,14 +282,20 @@ export default function Settings() {
                   type="text"
                   value={form.trae_cn_path ?? ''}
                   onChange={(e) => update('trae_cn_path', e.target.value.trim() || null)}
-                  placeholder="默认 C:\Users\你\AppData\Local\Programs\Trae CN\Trae CN.exe"
+                  placeholder={
+                    platform === 'macos'
+                      ? '默认 /Applications/Trae CN.app'
+                      : '默认 C:\\Users\\你\\AppData\\Local\\Programs\\Trae CN\\Trae CN.exe'
+                  }
                   className="input flex-1"
                 />
                 <button onClick={detectTraeCn} disabled={detectingCn} className="btn-outline shrink-0">
                   <Search size={15} /> {detectingCn ? '检测中…' : '自动检测'}
                 </button>
               </div>
-              <p className="mt-1 text-xs text-slate-400">Trae CN IDE 的 exe 路径。</p>
+              <p className="mt-1 text-xs text-slate-400">
+                {platform === 'macos' ? 'Trae CN IDE 的 .app 应用路径。' : 'Trae CN IDE 的 exe 路径。'}
+              </p>
             </div>
           </div>
 
