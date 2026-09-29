@@ -6,6 +6,27 @@
 
 ---
 
+## [1.3.4] · 2026-09-29 · SSE 断连检测全链路移植
+
+### 修复（移植 main@31fa051 自 8665e4c 以来的系统无关变更）
+
+- **SSE 客户端断连检测全链路（移植 main `24eb1d0` + `0028c93` + `73f3480` + `5abb891`）**：客户端（agent）断开后，僵尸流不再占用账号并发槽导致新请求排队超时（499 "Request aborted" 聚集于 maxWaitMs）：
+  - Trae 路径（`routes.rs` / `sse.rs`）：轮换与同账号重试入口 `tx.is_closed()` 快速终止；流转换发送点失败即退出读循环；Anthropic 路径 `send!` 宏置位 `disconnected` 标志主循环检测退出，断连后跳过收尾。
+  - 可中断行源（`wb_upstream.rs`）：新增 `InterruptibleLines`（`next_timeout` 区分 行/EOF/停滞窗口 三态，Iterator 语义兼容）；`lines_with_first_byte_timeout_interruptible` 供流式路径直用，ttfb 包装产物经 `from_iterator` 桥接（语义不变）。
+  - 停滞期轮询（`sse.rs` / `wb_sse.rs`）：转换循环改 500ms `LINE_POLL` 轮询取行，停滞窗口内检查 `sender.is_closed()`，断连即退出（不再死等上游 300s 读超时）；WB 解析器拆出 `feed_line` 共用，新增 `next_event_polling`。
+  - WB / 自定义渠道路由（`wb_route.rs` / `custom_route.rs`）：外层轮换、内层重试入口及 RetrySame 退避后断连即 return；活跃流期间逐事件顶部 `tx.is_closed()` 快速检测（对齐「发送失败即断」）。
+  - 断连即释放上游连接与账号并发槽，usage 记账取断连前已收到的 usage 事件；新增 5 个断连语义测试（`api_server::` 304 通过）。
+
+### 修复（移植后审查对齐，本地主动偏离 main 的 4 处）
+
+- **审查修复**：
+  - `routes.rs` 内层重试循环顶部补 `tx.is_closed()` 断连检查，对齐 `wb_route.rs` 既有写法（修复 401 自愈 continue 路径绕过外层检查、客户端已断连仍多发一次上游请求）。
+  - `sse.rs` 两个 OpenAI 系转换循环（chat/completions）补循环顶主动断连检测，与 Anthropic 版 / `wb_sse.rs` 风格统一（检测及时性增强）。
+  - `LINE_POLL` 轮询步长收敛至 `wb_upstream.rs` 单一事实来源（`sse.rs` / `wb_sse.rs` 改为引用），防后续调参漂移。
+  - 语义声明：流式路径改用 `InterruptibleLines` 后，流中途读错误由旧的「跳过继续读」（`chain_rest` filter_map）变为「首错即 EOF 终止」——SSE 场景读错误通常意味着连接坏死，终止属改进，并避免旧实现对持续读错误的忙转。
+
+---
+
 ## [1.3.3] · 2026-09-28 · 网关状态页看板增强
 
 ### 增强

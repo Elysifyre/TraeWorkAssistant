@@ -11,8 +11,11 @@
 //! 5. SSE keep-alive 15s（T2.7/F-34）+ 首字超时 10s 故障转移；
 //! 6. 用量记账 + 请求级日志（含 TTFB，F-32）。
 //!
-//! 客户端断连（F-34 §5.5 #8）：wb_sse 层对 send 失败（接收端已 drop）保持
-//! 消费上游直到 EOF——usage 完整记账，等效 `_drain_upstream`。
+//! 客户端断连（F-34 §5.5 #8，issue #41 系列 0028c93/73f3480/5abb891 修订）：
+//! 转发链路三层检测——轮换/重试入口 tx.is_closed() 快速终止、停滞期
+//! next_event_polling 轮询（LINE_POLL）、活跃流逐事件顶部检测；断连即终止
+//! 转发并释放账号并发槽（usage 记账取断连前已收到的上游 usage 事件，
+//! 不再为残缺流量保持消费上游到 EOF）。
 
 use std::collections::HashSet;
 use std::io::Read;
@@ -439,6 +442,10 @@ fn run_wb_stream(
     let mut refreshed: HashSet<String> = HashSet::new(); // 401 刷新每账号一次
 
     loop {
+        // 客户端断连检测：通道关闭即终止轮换/重试，不再占用账号并发槽（对齐 routes.rs stream_chat）
+        if tx.is_closed() {
+            return;
+        }
         // ── 取号：粘性/专一命中优先，否则按 Key 约束 + 调度策略；换号后仅走策略 ──
         let picked = match first_pick.take() {
             Some(p) => p,
@@ -497,6 +504,10 @@ fn run_wb_stream(
 
         let mut same_attempt: u32 = 0;
         loop {
+            // 客户端断连检测：重试等待/长路径期间离开则终止（同账号 guard 随 Drop 释放）
+            if tx.is_closed() {
+                return;
+            }
             let ttfb_start = Instant::now();
             match wb_upstream::make_wb_request(&creds, &converted) {
                 Ok(reader) => {
@@ -523,8 +534,13 @@ fn run_wb_stream(
                     // 对冲计数落定 + guard 重绑（接管时生效账号 = 对冲账号）
                     guard = settle_hedge(state, &mut win, guard, &picked.uid);
                     let win_uid = win.uid.as_str();
+                    // 竞速胜者行源（Box 迭代器）桥接为可中断行源：stream_forward_ex
+                    // 停滞期间周期性检查断连（转发线程复用；语义与既有 ttfb 包装一致）
+                    let win_lines = super::wb_upstream::InterruptibleLines::from_iterator(
+                        Box::new(win.lines) as Box<dyn Iterator<Item = String> + Send>,
+                    );
                     let (error_info, sent_any, failed_inline, usage) =
-                        wb_sse::stream_forward_ex(win.lines, tx, proto, chat_id, model);
+                        wb_sse::stream_forward_ex(win_lines, tx, proto, chat_id, model);
                     let duration_ms = start_ts.elapsed().as_millis() as u64;
                     {
                         let (pt, ct) = usage
@@ -595,6 +611,10 @@ fn run_wb_stream(
                         RetryAction::RetrySame { delay_ms } => {
                             same_attempt += 1;
                             std::thread::sleep(std::time::Duration::from_millis(delay_ms.min(60_000)));
+                            // 断连检测：重试等待期间客户端离开则终止，不再占用该账号并发槽
+                            if tx.is_closed() {
+                                return;
+                            }
                             continue;
                         }
                         RetryAction::SwitchKey => {

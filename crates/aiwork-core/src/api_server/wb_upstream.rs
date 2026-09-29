@@ -24,6 +24,11 @@ pub const WB_UA: &str = "CLI/2.63.2 CodeBuddy/2.63.2";
 pub const WB_REFRESH_URL: &str = "https://www.codebuddy.cn/v2/plugin/auth/token/refresh";
 /// 首字超时（F-34）：上游建连后 10s 内未产出任何字节 → 故障转移
 pub const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(10);
+/// SSE 消费端停滞轮询步长（单一事实来源，sse.rs 转换循环 / wb_sse.rs
+/// next_event_polling 共用）：上游停滞期间每 500ms 醒来检查一次客户端
+/// 是否断连（sender.is_closed()），避免「断连 + 上游停滞」时死等下一行
+/// （最长 300s 读超时）才释放账号并发槽
+pub const LINE_POLL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Default)]
 pub struct WbCreds {
@@ -136,6 +141,79 @@ pub fn make_wb_request(c: &WbCreds, body: &[u8]) -> Result<Box<dyn Read + Send>,
     }
 }
 
+/// 可中断行源：基于转发线程 + channel receiver 的行迭代器，额外提供带超时的
+/// 取行（next_timeout）。供 sse.rs 流式转换循环在「上游停滞」期间周期性醒来
+/// 检查客户端断连（sender.is_closed()），避免僵尸流死等上游下一行
+/// （最长 300s 读超时）才退出、期间一直占用账号并发槽。
+pub struct InterruptibleLines {
+    rx: std::sync::mpsc::Receiver<std::io::Result<String>>,
+    /// 首行（from_reader 首字窗口内产出；Iterator/next_timeout 下优先取出）
+    pending: Option<String>,
+}
+
+impl InterruptibleLines {
+    /// reader → 可中断行源：首行以 FIRST_BYTE_TIMEOUT 超时等待（F-34 首字
+    /// 超时 → 故障转移），Err(()) = 首字超时/首行前出错。后续行无超时
+    /// （正常流式出包不受限）；转发线程 detach（受 Agent 300s 读超时兜底
+    /// 自然退出，不无限泄漏）。
+    pub fn from_reader<R: Read + Send + 'static>(reader: R) -> Result<Self, ()> {
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        relay_lines(reader, tx);
+        // 首字（可为空行/注释行，均视为"已开始产出"）
+        match rx.recv_timeout(FIRST_BYTE_TIMEOUT) {
+            Ok(Ok(first)) => Ok(Self {
+                rx,
+                pending: Some(first),
+            }),
+            _ => Err(()),
+        }
+    }
+
+    /// 任意行迭代器 → 可中断行源（转发线程桥接；测试与内存切分形态复用）
+    pub fn from_iterator(inner: Box<dyn Iterator<Item = String> + Send>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        std::thread::spawn(move || {
+            for line in inner {
+                if tx.send(Ok(line)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { rx, pending: None }
+    }
+
+    /// 带超时取行：
+    /// - Ok(Some(line))：取到一行
+    /// - Ok(None)：流结束（读错误折叠为 EOF；转发线程退出等同 EOF，与既有语义一致）
+    /// - Err(())：dur 窗口内无行（上游停滞，非 EOF）。调用方可借此检查
+    ///   客户端断连（sender.is_closed()）后继续等待
+    pub fn next_timeout(&mut self, dur: Duration) -> Result<Option<String>, ()> {
+        if let Some(line) = self.pending.take() {
+            return Ok(Some(line));
+        }
+        match self.rx.recv_timeout(dur) {
+            Ok(Ok(line)) => Ok(Some(line)),
+            Ok(Err(_)) => Ok(None),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(()),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Ok(None),
+        }
+    }
+}
+
+impl Iterator for InterruptibleLines {
+    type Item = String;
+    fn next(&mut self) -> Option<String> {
+        if let Some(line) = self.pending.take() {
+            return Some(line);
+        }
+        match self.rx.recv() {
+            Ok(Ok(line)) => Some(line),
+            Ok(Err(_)) => None, // 读错误折叠为 EOF（与既有语义一致）
+            Err(_) => None,     // 转发线程退出 = EOF
+        }
+    }
+}
+
 /// 行迭代封装：首行以 FIRST_BYTE_TIMEOUT 超时等待（F-34 首字超时 → 故障转移），
 /// 后续行无超时（正常流式出包不受限）。
 ///
@@ -144,13 +222,15 @@ pub fn make_wb_request(c: &WbCreds, body: &[u8]) -> Result<Box<dyn Read + Send>,
 pub fn lines_with_first_byte_timeout<R: Read + Send + 'static>(
     reader: R,
 ) -> Result<Box<dyn Iterator<Item = String> + Send>, ()> {
-    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
-    relay_lines(reader, tx);
-    // 首字（可为空行/注释行，均视为"已开始产出"）
-    match rx.recv_timeout(FIRST_BYTE_TIMEOUT) {
-        Ok(Ok(first)) => Ok(chain_rest(first, rx)),
-        _ => Err(()),
-    }
+    Ok(Box::new(InterruptibleLines::from_reader(reader)?))
+}
+
+/// 同 lines_with_first_byte_timeout，但返回可中断行源：sse.rs 流式转换
+/// 需要在上游停滞期间周期性检查客户端断连（next_timeout + sender.is_closed）
+pub fn lines_with_first_byte_timeout_interruptible<R: Read + Send + 'static>(
+    reader: R,
+) -> Result<InterruptibleLines, ()> {
+    InterruptibleLines::from_reader(reader)
 }
 
 /// reader → channel 行转发线程（首字超时/竞速共用）
@@ -168,7 +248,7 @@ fn relay_lines<R: Read + Send + 'static>(
     });
 }
 
-/// 首行 + 剩余行组装为行迭代器
+/// 首行 + 剩余行组装为行迭代器（竞速对冲路径使用：胜者 receiver 直接折叠）
 fn chain_rest(
     first: String,
     rx: std::sync::mpsc::Receiver<std::io::Result<String>>,
@@ -539,6 +619,50 @@ mod tests {
         fn drop(&mut self) {
             self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    // ==================== 可中断行源（InterruptibleLines） ====================
+
+    #[test]
+    fn interruptible_lines_next_timeout_semantics() {
+        // 语义契约：Ok(Some)=行 / Ok(None)=EOF / Err=窗口内停滞（非 EOF）
+        let mut src = InterruptibleLines::from_iterator(Box::new(
+            ["a", "b"].iter().map(|s| s.to_string()),
+        ));
+        assert_eq!(src.next_timeout(Duration::from_millis(50)), Ok(Some("a".into())));
+        assert_eq!(src.next_timeout(Duration::from_millis(50)), Ok(Some("b".into())));
+        assert_eq!(src.next_timeout(Duration::from_millis(50)), Ok(None));
+    }
+
+    #[test]
+    fn interruptible_lines_timeout_then_line_arrives() {
+        // 停滞（窗口内无行，Err）→ 数据到达 → 正常取行；Iterator 语义不受影响
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        let mut src = InterruptibleLines {
+            rx,
+            pending: None,
+        };
+        assert_eq!(src.next_timeout(Duration::from_millis(30)), Err(()));
+        tx.send(Ok("late".into())).unwrap();
+        assert_eq!(src.next_timeout(Duration::from_millis(500)), Ok(Some("late".into())));
+        drop(tx);
+        assert_eq!(src.next_timeout(Duration::from_millis(500)), Ok(None));
+        // Iterator 兜底语义：EOF 之后 next() 持续 None
+        assert_eq!(src.next(), None);
+    }
+
+    #[test]
+    fn interruptible_lines_read_error_folds_to_eof() {
+        // 读错误折叠为 EOF（与 lines_with_first_byte_timeout 既有语义一致）
+        let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        let mut src = InterruptibleLines {
+            rx,
+            pending: None,
+        };
+        tx.send(Err(std::io::Error::other("boom"))).unwrap();
+        assert_eq!(src.next_timeout(Duration::from_millis(500)), Ok(None));
+        drop(tx); // 释放 sender：否则下方阻塞式 next() 永久等待（recv 无界）
+        assert_eq!(src.next(), None);
     }
 
     #[test]

@@ -10,8 +10,11 @@
 //! 输入统一为行迭代器（便于首字超时等上层封装），不直接持有 Reader。
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde_json::{json, Value};
+
+use super::wb_upstream::{InterruptibleLines, LINE_POLL};
 
 /// WB 上游单个 SSE 事件（已归一化）
 #[derive(Debug)]
@@ -50,11 +53,41 @@ impl<L: Iterator<Item = String>> WbSseParser<L> {
         }
         loop {
             let line = self.lines.next()?;
-            let line = line.trim_end();
-            if line.is_empty() {
-                if self.data.is_empty() {
-                    continue;
+            if let Some(ev) = self.feed_line(&line) {
+                return Some(ev);
+            }
+        }
+    }
+
+    /// 单行喂入：返回该行触发的事件（跨行 data 拼接 + 紧凑流兼容 + `:` 注释跳过）。
+    /// 供 next_event 与 next_event_polling 共用（逻辑与拆分前逐行等价）
+    fn feed_line(&mut self, line: &str) -> Option<WbEvent> {
+        let line = line.trim_end();
+        if line.is_empty() {
+            if self.data.is_empty() {
+                return None;
+            }
+            let payload = std::mem::take(&mut self.data);
+            if let Some(ev) = parse_data(&payload) {
+                if matches!(ev, WbEvent::Done) {
+                    self.done = true;
                 }
+                return Some(ev);
+            }
+            return None;
+        }
+        if line.starts_with(':') {
+            return None; // SSE 注释（keep-alive 等）
+        }
+        if let Some(rest) = line.strip_prefix("data:") {
+            self.data.push_str(rest.trim_start());
+            // 紧凑流兼容（部分上游不按「空行分隔」发帧）：
+            // 缓冲已是完整载荷（[DONE] 或完整 JSON）→ 立即产出，不等空行；
+            // 否则继续按 SSE 规范做多行 data 拼接
+            let t = self.data.trim();
+            let complete = t == "[DONE]"
+                || (t.starts_with('{') && serde_json::from_str::<Value>(t).is_ok());
+            if complete {
                 let payload = std::mem::take(&mut self.data);
                 if let Some(ev) = parse_data(&payload) {
                     if matches!(ev, WbEvent::Done) {
@@ -62,30 +95,39 @@ impl<L: Iterator<Item = String>> WbSseParser<L> {
                     }
                     return Some(ev);
                 }
-                continue;
             }
-            if line.starts_with(':') {
-                continue; // SSE 注释（keep-alive 等）
-            }
-            if let Some(rest) = line.strip_prefix("data:") {
-                self.data.push_str(rest.trim_start());
-                // 紧凑流兼容（部分上游不按「空行分隔」发帧）：
-                // 缓冲已是完整载荷（[DONE] 或完整 JSON）→ 立即产出，不等空行；
-                // 否则继续按 SSE 规范做多行 data 拼接
-                let t = self.data.trim();
-                let complete = t == "[DONE]"
-                    || (t.starts_with('{') && serde_json::from_str::<Value>(t).is_ok());
-                if complete {
-                    let payload = std::mem::take(&mut self.data);
-                    if let Some(ev) = parse_data(&payload) {
-                        if matches!(ev, WbEvent::Done) {
-                            self.done = true;
-                        }
-                        return Some(ev);
+        }
+        // 其余行（event:/id:/retry:/未知）忽略：WB 上游标准 OpenAI 流
+        None
+    }
+}
+
+impl WbSseParser<InterruptibleLines> {
+    /// 停滞感知取事件（WB 路由流式专用）：行源为可中断行源，上游停滞窗口内
+    /// 周期性醒来检查客户端断连（client_gone，通常为 tx.is_closed()）——
+    /// 断连即返回 None 终止转发，释放上游连接与账号并发槽；未断连则继续等待
+    pub fn next_event_polling(
+        &mut self,
+        poll: Duration,
+        client_gone: &dyn Fn() -> bool,
+    ) -> Option<WbEvent> {
+        if self.done {
+            return None;
+        }
+        loop {
+            let line = match self.lines.next_timeout(poll) {
+                Ok(Some(line)) => line,
+                Ok(None) => return None, // 流结束（读错误折叠为 EOF）
+                Err(()) => {
+                    if client_gone() {
+                        return None; // 客户端已断连：终止，不再读上游
                     }
+                    continue; // 仅停滞未断连：继续等待
                 }
+            };
+            if let Some(ev) = self.feed_line(&line) {
+                return Some(ev);
             }
-            // 其余行（event:/id:/retry:/未知）忽略：WB 上游标准 OpenAI 流
         }
     }
 }
@@ -179,10 +221,12 @@ fn responses_object(id: &str, model: &str, status: &str, output: Vec<Value>, usa
 /// - failed_inline：流内失败事件（response.failed / error 帧）已就地透传客户端——
 ///   调用方不得再按成功收尾（不记成功、不清冷却、不绑定粘性），也不应重试
 ///   （错误已原样给到客户端，重试会造成重复流）。
+/// - 行源须为可中断行源：上游停滞期间每 LINE_POLL 检查一次客户端断连
+///   （tx.is_closed()），断连即终止转发（上游连接与账号并发槽随 Drop 释放）
 // 宏内末次赋值（text_block_open）在收尾路径后不再读取，属预期行为（对齐 sse.rs）
 #[allow(unused_assignments)]
-pub fn stream_forward_ex<L: Iterator<Item = String>>(
-    lines: L,
+pub fn stream_forward_ex(
+    lines: InterruptibleLines,
     tx: &Sender,
     proto: crate::api_server::routes::Protocol,
     chat_id: &str,
@@ -254,7 +298,13 @@ pub fn stream_forward_ex<L: Iterator<Item = String>>(
     }
 
     loop {
-        match parser.next_event() {
+        // 客户端断连快速检测（对齐 sse.rs「发送失败即断」）：send! 宏忽略发送
+        // 失败，活跃流期间的断连依赖此处逐事件检查，最坏延迟一个事件的处理耗时；
+        // 停滞期间的断连由 next_event_polling 的 Err 分支覆盖
+        if tx.is_closed() {
+            break;
+        }
+        match parser.next_event_polling(LINE_POLL, &|| tx.is_closed()) {
             None => break,
             Some(WbEvent::Done) => {
                 match proto {
@@ -623,8 +673,8 @@ pub fn stream_forward_ex<L: Iterator<Item = String>>(
 
 /// 兼容封装：旧三元组返回（既有调用方不感知流内失败标记；
 /// 新调用方请用 stream_forward_ex）
-pub fn stream_forward<L: Iterator<Item = String>>(
-    lines: L,
+pub fn stream_forward(
+    lines: InterruptibleLines,
     tx: &Sender,
     proto: crate::api_server::routes::Protocol,
     chat_id: &str,
@@ -855,8 +905,57 @@ fn now_ts() -> u64 {
 mod tests {
     use super::*;
 
-    fn lines(v: &[&str]) -> std::vec::IntoIter<String> {
-        v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    /// 测试行源：包装为可中断行源（stream_forward_ex 现要求 InterruptibleLines；
+    /// 其同时实现 Iterator，aggregate 等泛型调用点无需区分）
+    fn lines(v: &[&str]) -> InterruptibleLines {
+        InterruptibleLines::from_iterator(Box::new(
+            v.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter(),
+        ))
+    }
+
+    /// 停滞 + 断连：上游永不产出、客户端已断连 → next_event_polling 应在一个
+    /// 轮询窗口内返回 None（而非死等上游下一行 / 300s 读超时）
+    #[test]
+    fn next_event_polling_aborts_on_disconnect_during_stall() {
+        let (_tx_keep, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+        // sender 存活但无数据：桥接线程阻塞在行迭代器上，模拟上游停滞
+        let stall = Box::new(rx.into_iter().filter_map(|r| r.ok()));
+        let mut parser = WbSseParser::new(InterruptibleLines::from_iterator(stall));
+        let client_gone = || true;
+        let start = std::time::Instant::now();
+        assert!(parser.next_event_polling(LINE_POLL, &client_gone).is_none());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "断连后应在一个轮询窗口内返回，实测 {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// 活跃流 + 断连：上游持续产出且无 [DONE]（不断流），客户端通道已关闭 →
+    /// 逐事件快速检测应立即终止（sent_any=false），而非读完整条流才结束
+    #[test]
+    fn stream_forward_aborts_immediately_when_client_gone() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(64);
+        drop(rx); // 客户端已断连
+        let data: Vec<String> = (0..1000)
+            .flat_map(|i| {
+                vec![
+                    format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"t{}\"}}}}]}}", i),
+                    String::new(),
+                ]
+            })
+            .collect();
+        let src = InterruptibleLines::from_iterator(Box::new(data.into_iter()));
+        let start = std::time::Instant::now();
+        let (_err, sent_any, _fi, _u) = stream_forward_ex(
+            src, &tx, crate::api_server::routes::Protocol::OpenAi, "c", "m",
+        );
+        assert!(!sent_any, "断连后不得有任何事件下发");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "活跃流断连应立即终止，实测 {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
