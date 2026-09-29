@@ -11,6 +11,12 @@
 //! 不变量 → 读顺序 file 优先；Keychain 读写失败一律降级容忍（fail-open），仅作
 //! 存量兼容与兜底线索。Windows 构建零变化。
 //!
+//! mac key file 威胁模型注记（合并审查 #10）：hex 明文 + 0600 权限防的是「同机
+//! 普通用户进程」越权读取；同机 root、磁盘镜像、物理接触本就无防护边界——Keychain
+//! 条目同样可被 root 提取（security dump-keychain / 同 TCC 域直调）。这与 Windows
+//! DPAPI 的用户级威胁模型完全一致（DPAPI blob 对同用户任意进程可解），不构成
+//! mac 侧额外的安全降级，故维持现状不加额外加密层。
+//!
 //! 设计决策——为什么用 keyring crate 而非 `security` CLI：CLI 的 `-w <密码>` 参数
 //! 会暴露在进程列表（`ps` 可见），是真实的秘密泄露面；keyring 直调 Security.framework
 //! 无此问题（backlog F-75 表格既定迁移目标 hwchen/keyring-rs）。

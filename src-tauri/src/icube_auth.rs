@@ -109,12 +109,69 @@ pub struct DeviceCredential {
     pub source_app: String,
 }
 
+/// mac 客户端版本号（DeviceInfo.ClientVersion 用）：安装 bundle Info.plist 的
+/// CFBundleShortVersionString（合并审查 #9：原实现读 Windows Programs 安装目录
+/// package.json，mac 恒缺失 → ClientVersion 恒空串）。/Applications 与
+/// ~/Applications 双根扫描；bundle 目录名候选 + CFBundleIdentifier 白名单防串台
+///（与 env.rs mac 定位链同源，M-1 侦察 ⑥：四应用 CFBundleExecutable 均为
+/// "Electron"，bundle id 才是身份信号）。未找到 → 空串降级（与 Windows 侧
+/// package.json 缺失行为一致）。
+#[cfg(target_os = "macos")]
+fn mac_app_version(app: &str) -> String {
+    use crate::switcher::locate::{bundle_exe_matches, is_bundle_dir, read_info_plist_value};
+    let (names, bundle_ids): (&[&str], &[&str]) = match app {
+        "Trae CN" | "Trae" => (&["Trae", "Trae CN"], &["cn.trae.app"]),
+        "TRAE SOLO CN" | "Trae Work" => (
+            &["Trae Work", "TRAE SOLO CN", "TRAE SOLO", "Trae"],
+            &["cn.trae.solo.app"],
+        ),
+        _ => return String::new(),
+    };
+    let home = std::env::var("HOME").unwrap_or_default();
+    for base in ["/Applications", &format!("{home}/Applications")] {
+        for name in names {
+            let bundle = std::path::Path::new(base).join(format!("{name}.app"));
+            if is_bundle_dir(&bundle) && bundle_exe_matches(&bundle, &[], bundle_ids) {
+                return read_info_plist_value(&bundle, "CFBundleShortVersionString")
+                    .unwrap_or_default();
+            }
+        }
+    }
+    String::new()
+}
+
+/// 客户端版本号（DeviceInfo.ClientVersion 用）：Windows=安装目录 package.json
+/// version（真实客户端上报的是 appVersion，与服务端对设备注册记录的校验相关）；
+/// mac=安装 bundle Info.plist CFBundleShortVersionString。读取失败 → 空串。
+fn app_version_for(localappdata: &std::path::Path, app: &str) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = localappdata;
+        mac_app_version(app)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::fs::read_to_string(
+            localappdata
+                .join("Programs")
+                .join(app)
+                .join("resources")
+                .join("app")
+                .join("package.json"),
+        )
+        .ok()
+        .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
+        .and_then(|p| p.get("version").and_then(|x| x.as_str()).map(String::from))
+        .unwrap_or_default()
+    }
+}
+
 /// 扫描本机各 Trae 客户端 storage.json 提取设备凭证（多个客户端各有一套）。
 /// 找不到/解密失败返回空表——DeviceProof 不可用时调用方回落无 proof 变体。
 pub fn extract_device_credentials() -> Vec<DeviceCredential> {
     // F-75 跨平台收口：storage.json 基根 Windows=%APPDATA% / mac=Application Support
     // （Trae 桌面客户端两平台同为 Electron 布局 User/globalStorage）；
-    // Programs 安装目录探测仅 Windows 存在，mac 读取失败走 unwrap_or_default 降级
+    // 版本号读取按平台分派（app_version_for：Windows=Programs package.json / mac=bundle Info.plist）
     let Ok(appdata) = crate::platform::app_support_root() else {
         return Vec::new();
     };
@@ -133,20 +190,7 @@ pub fn extract_device_credentials() -> Vec<DeviceCredential> {
             continue;
         };
         let Some(obj) = v.as_object() else { continue };
-        // DeviceInfo.ClientVersion 用：安装目录 package.json 的 version（真实客户端
-        // 上报的是 appVersion，与服务端对设备注册记录的校验相关）
-        let app_version = std::fs::read_to_string(
-            localappdata
-                .join("Programs")
-                .join(app)
-                .join("resources")
-                .join("app")
-                .join("package.json"),
-        )
-        .ok()
-        .and_then(|p| serde_json::from_str::<serde_json::Value>(&p).ok())
-        .and_then(|p| p.get("version").and_then(|x| x.as_str()).map(String::from))
-        .unwrap_or_default();
+        let app_version = app_version_for(&localappdata, app);
         let machine_id = obj
             .get("telemetry.machineId")
             .and_then(|x| x.as_str())

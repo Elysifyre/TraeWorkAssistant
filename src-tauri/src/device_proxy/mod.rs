@@ -679,6 +679,10 @@ pub fn sync_account_devices(ctx: &ProxyCtx) {
 
 /// Windows：WSASocketW + SO_EXCLUSIVEADDRUSE 独占绑定（选项必须在 bind 前设置，
 /// 对齐 Python `srv.setsockopt(SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1)`，issue #7）；
+/// macOS：tokio TcpSocket 显式 set_reuseaddr(true)——std bind 在 Unix 上不设该
+/// 选项（rust-lang/rust#12886），不设则 TIME_WAIT 残留期间重启必失败；BSD 语义下
+/// REUSEADDR 只允许接管**无监听者**的端口（含 TIME_WAIT），不能劫持活动监听，
+/// 与「重启必成功」服务目标兼容（合并审查 #6 注释纠偏）；
 /// 其他平台：常规绑定（不设 SO_REUSEADDR，同样拒绝同端口重复绑定）。
 fn bind_exclusive(port: u16) -> Result<std::net::TcpListener, String> {
     #[cfg(target_os = "windows")]

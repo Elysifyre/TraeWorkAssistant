@@ -444,10 +444,8 @@ fn sync_cookie_state(state: &AppState, logs: &mut Vec<String>) -> Value {
         }
     };
 
-    // 基根：Windows=%LOCALAPPDATA%，mac=Application Support（豆包桌面端 Chromium 布局）
-    let ud = crate::platform::local_data_root_lossy()
-        .join("Doubao")
-        .join("User Data");
+    // 单一事实源（合并审查 #1：Windows 带 User Data 层，mac 直挂 Doubao 根）
+    let ud = crate::switcher::profile::doubao_data_dir();
     if ud.exists() {
         diagnose("live", &ud, &mut sources, logs);
     }

@@ -139,21 +139,50 @@ pub async fn do_start(
     let _ = std::fs::write(state.data_dir.join("last_proxy_port.txt"), port.to_string());
     let proxy_addr = format!("127.0.0.1:{port}");
 
-    // 端口预检（友好报错；真正的独占绑定在 ProxyServer::start 内以
-    // SO_EXCLUSIVEADDRUSE 完成，issue #7 防重复绑定「假启动」）。
-    // mac 无需显式 SO_REUSEADDR：std 在非 Windows 平台的 TcpListener::bind
-    // 内置该选项（TIME_WAIT 残留不会误报占用），Windows 则显式不设（防劫持）。
-    match std::net::TcpListener::bind(("127.0.0.1", port)) {
-        Ok(l) => drop(l),
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            // PID 诊断（对齐 Python 绑定失败时列出占用进程）
-            let pids = port_pids(port);
-            let pid_info = if pids.is_empty() { "未知".to_string() } else { pids.join(",") };
-            return Err(format!(
-                "端口 {port} 被其他程序占用（PID: {pid_info}），请修改代理端口或手动结束后重试"
-            ));
+    #[cfg(target_os = "macos")]
+    {
+        // mac 预检 = 活动监听探测（合并审查 #6）：std::net TcpListener::bind 在
+        // Unix 上**不**设置 SO_REUSEADDR（rust-lang/rust#12886），直接 bind 预检
+        // 会把 TIME_WAIT 残留误报成「端口占用」——代理快速重启场景必现。
+        // connect 成功 = 确有监听者 → 报占用；ConnectionRefused = 无监听
+        //（TIME_WAIT 残留）→ 放行，随后 bind_exclusive 的 set_reuseaddr(true)
+        // 可正常接管。探测与绑定间存在 TOCTOU 竞态窗口，bind_exclusive 失败时
+        // 仍以原始 io 错误兜底报错，不会假启动。
+        match std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            std::time::Duration::from_millis(300),
+        ) {
+            Ok(_) => {
+                // PID 诊断（对齐 Python 绑定失败时列出占用进程）
+                let pids = port_pids(port);
+                let pid_info = if pids.is_empty() { "未知".to_string() } else { pids.join(",") };
+                return Err(format!(
+                    "端口 {port} 被其他程序占用（PID: {pid_info}），请修改代理端口或手动结束后重试"
+                ));
+            }
+            // 无监听（TIME_WAIT 残留等）→ 放行
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+            Err(e) => return Err(format!("端口探测失败: {e}")),
         }
-        Err(e) => return Err(format!("端口探测失败: {e}")),
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // 端口预检（友好报错；真正的独占绑定在 ProxyServer::start 内以
+        // SO_EXCLUSIVEADDRUSE 完成，issue #7 防重复绑定「假启动」）。
+        // Windows std bind 语义 = 独占（SO_EXCLUSIVEADDRUSE），预检即最终语义：
+        // 占用（含 TIME_WAIT 残留）一律拦截，与 bind_exclusive 行为一致。
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(l) => drop(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                // PID 诊断（对齐 Python 绑定失败时列出占用进程）
+                let pids = port_pids(port);
+                let pid_info = if pids.is_empty() { "未知".to_string() } else { pids.join(",") };
+                return Err(format!(
+                    "端口 {port} 被其他程序占用（PID: {pid_info}），请修改代理端口或手动结束后重试"
+                ));
+            }
+            Err(e) => return Err(format!("端口探测失败: {e}")),
+        }
     }
 
     // 捕获启动前的系统代理（通常是用户的 VPN 梯子，如 Clash/v2rayN 本地代理）。

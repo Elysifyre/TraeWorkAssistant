@@ -47,8 +47,10 @@ fn home_join(rel: &str) -> PathBuf {
 }
 
 /// 豆包数据目录（M-1 侦察 ③ 实测差异）：Windows 带 `User Data` 层，
-/// mac 为 Chromium 直挂 `~/Library/Application Support/Doubao`（Local State/Default 在根）
-fn doubao_data_dir() -> PathBuf {
+/// mac 为 Chromium 直挂 `~/Library/Application Support/Doubao`（Local State/Default 在根）。
+/// 全库单一事实源（合并审查 #1）：commands/doubao.rs、tasks/doubao_chats.rs、
+/// tasks/doubao_session.rs 的豆包目录推导一律走本函数，禁止再手拼 join("User Data")
+pub(crate) fn doubao_data_dir() -> PathBuf {
     #[cfg(windows)]
     {
         local_dir("Doubao").join("User Data")

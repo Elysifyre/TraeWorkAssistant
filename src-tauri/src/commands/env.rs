@@ -688,7 +688,7 @@ fn finish_locate_macos(
     use crate::switcher::locate::read_info_plist_value;
     let version = read_info_plist_value(&app, "CFBundleShortVersionString");
     AppLocate {
-        app: display.to_lowercase().replace(' ', "_"),
+        app: app_slug(display),
         exe: Some(app.to_string_lossy().to_string()),
         user_data_dir: user_data_dir.to_string(),
         version,
@@ -751,6 +751,18 @@ pub fn app_locate(state: State<AppState>, target_app: Option<String>) -> AppLoca
     app_locate_inner(&state, target_app.as_deref().unwrap_or("trae_work"))
 }
 
+/// AppLocate.app 值域统一（合并审查 #7）：display → 英文 slug，双平台一致。
+/// 唯一非 ASCII display 是豆包「豆包」（to_lowercase 不变 → 原产出中文），
+/// 特判为 "doubao"；其余走小写 + 空格转下划线。前端不消费 .app 字段（仅
+/// version/exe/userDataDir/source），值域变化安全；not_found 分支返回原始
+/// 参数的语义保持不变。
+fn app_slug(display: &str) -> String {
+    match display {
+        "豆包" => "doubao".to_string(),
+        d => d.to_lowercase().replace(' ', "_"),
+    }
+}
+
 /// 命中后统一补齐版本号并组装结果
 #[cfg(not(target_os = "macos"))]
 fn finish_locate(profile: &AppProfile, exe: String, source: &str, version: Option<String>) -> AppLocate {
@@ -764,7 +776,7 @@ fn finish_locate(profile: &AppProfile, exe: String, source: &str, version: Optio
         }
     }
     AppLocate {
-        app: profile.display.to_lowercase().replace(' ', "_"),
+        app: app_slug(&profile.display),
         exe: Some(exe),
         user_data_dir: profile.user_data_dir.clone(),
         version,

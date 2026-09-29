@@ -231,7 +231,8 @@ let lastLogsErrToastAt = 0;
 
 export const useAppStore = create<AppState>((set, get) => ({
   ready: false,
-  platform: 'windows',
+  // 初始兜底用 UA 猜测（mac = "Macintosh; Intel Mac OS X"），platform_info 成功后覆盖
+  platform: /Mac/i.test(navigator.userAgent) ? 'macos' : 'windows',
   view: 'dashboard',
   activeApp: 'trae',
   env: null,

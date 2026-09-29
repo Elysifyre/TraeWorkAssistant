@@ -680,7 +680,13 @@ pub fn update_run_installer(
             .arg(path)
             .spawn()
             .map_err(|e| format!("打开安装包失败: {e}（可手动打开：{file_path}）"))?;
-        let _ = app.emit("update-installing", asset_name);
+        // 结果型事件：emit 失败落 stderr（issue #44 约定；与 Windows 分支同语义）
+        crate::events::emit_logged(
+            &app,
+            "update-installing",
+            serde_json::Value::String(asset_name),
+            None,
+        );
         return Ok(());
     }
 
@@ -769,7 +775,8 @@ pub fn update_restart_app(app: AppHandle) -> Result<(), String> {
                 status.code()
             ));
         }
-        let _ = app.emit("update-restarting", ());
+        // 结果型事件：emit 失败落 stderr（issue #44 约定；即将 exit，无 data_dir 需求）
+        crate::events::emit_logged(&app, "update-restarting", serde_json::Value::Null, None);
         std::thread::sleep(Duration::from_millis(800));
         std::process::exit(0);
     }

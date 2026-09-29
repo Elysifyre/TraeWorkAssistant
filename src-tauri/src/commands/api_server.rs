@@ -998,6 +998,10 @@ pub struct LanIfaceIp {
 /// VPN 虚拟网卡（Tailscale / ZeroTier / Clash 等）、蓝牙 PAN / 拨号虚拟适配器、
 /// macOS 专属虚拟接口（Docker Desktop 网桥 bridge100* / Apple Wireless Direct
 /// Link awdl0 / 低时延 WLAN llw0——`br-` 不命中 `bridge100`，单独收录）。
+/// bridge 编号特例（合并审查 #8）：`bridge0`…`bridge99` 是 mac Thunderbolt 网桥
+/// 的真实网卡命名（可承载局域网流量），先于黑名单放行；`bridge100` 起为 Docker
+/// Desktop 保留编号，仍按黑名单拦截。非纯数字后缀（bridge / bridgeabc /
+/// bridge100x）parse 失败 → 落回黑名单子串匹配。
 /// 中文接口名（「以太网」「WLAN」「本地连接」）与常规英文网卡名均不含关键词
 fn is_virtual_iface(name: &str) -> bool {
     const BLACKLIST: &[&str] = &[
@@ -1009,6 +1013,12 @@ fn is_virtual_iface(name: &str) -> bool {
         "awdl", "llw",
     ];
     let n = name.to_lowercase();
+    // Thunderbolt 网桥放行（bridge0…bridge99）；Docker Desktop 从 bridge100 起编号
+    if let Some(num) = n.strip_prefix("bridge") {
+        if let Ok(id) = num.parse::<u32>() {
+            return id >= 100;
+        }
+    }
     if BLACKLIST.iter().any(|k| n.contains(k)) {
         return true;
     }
@@ -1467,6 +1477,9 @@ mod lan_iface_tests {
         assert!(!is_virtual_iface("Wi-Fi"));
         assert!(!is_virtual_iface("Intel(R) Wi-Fi 6 AX201 160MHz"));
         assert!(!is_virtual_iface("Realtek Gaming 2.5GbE Family Controller"));
+        // macOS Thunderbolt 网桥（合并审查 #8：bridge0…bridge99 为真实网卡，放行）
+        assert!(!is_virtual_iface("bridge0"), "mac Thunderbolt 网桥");
+        assert!(!is_virtual_iface("bridge2"));
     }
 
     /// 真机冒烟：不 panic；结果无回环/链路本地/IPv6，无虚拟网卡名，按 IP 去重

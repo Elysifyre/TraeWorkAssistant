@@ -230,7 +230,7 @@ export default function DoubaoSettings() {
 
         <div className="space-y-2 text-xs text-slate-500">
           <p>
-            数据目录：<code className="rounded bg-slate-100 px-1 font-mono dark:bg-zinc-800">{locate?.user_data_dir ?? (platform === 'macos' ? '~/Library/Application Support/Doubao/User Data' : '%LOCALAPPDATA%\\Doubao\\User Data')}</code>
+            数据目录：<code className="rounded bg-slate-100 px-1 font-mono dark:bg-zinc-800">{locate?.user_data_dir ?? (platform === 'macos' ? '~/Library/Application Support/Doubao' : '%LOCALAPPDATA%\\Doubao\\User Data')}</code>
             {locate?.version ? ` · 版本 ${locate.version}` : ''}
           </p>
         </div>

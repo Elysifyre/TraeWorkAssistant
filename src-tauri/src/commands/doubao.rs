@@ -440,12 +440,10 @@ fn analyze_login_sessions(user_data: &std::path::Path) -> LoginSessionAnalysis {
 }
 
 /// 豆包客户端 User Data 目录（Live 态，登录 Cookie/uid 检测用）。
-/// 基根：Windows=%LOCALAPPDATA%，mac=Application Support（豆包桌面端 Chromium 布局）
+/// 单一事实源 switcher::profile::doubao_data_dir（Windows 带 User Data 层，
+/// mac 直挂 ~/Library/Application Support/Doubao——合并审查 #1）
 fn doubao_live_user_data_dir() -> Option<PathBuf> {
-    let dir = crate::platform::local_data_root()
-        .ok()?
-        .join("Doubao")
-        .join("User Data");
+    let dir = crate::switcher::profile::doubao_data_dir();
     dir.exists().then_some(dir)
 }
 
@@ -591,12 +589,8 @@ fn read_captured_uid(state: &State<AppState>) -> Option<String> {
 /// 来源①：从 User Data/Local State 的 profile.info_cache 取最近活跃 Profile 的 saman.user_id。
 /// 文件缺失/无 saman 块/解析失败返回 Ok(None)。
 fn detect_uid_from_local_state() -> Result<Option<String>, String> {
-    let base = crate::platform::local_data_root()
-        .map_err(|e| format!("读取应用数据根目录失败: {e}"))?;
-    let path = base
-        .join("Doubao")
-        .join("User Data")
-        .join("Local State");
+    // 单一事实源（合并审查 #1：mac 无 User Data 层，原手拼 join 在 mac 恒 miss）
+    let path = crate::switcher::profile::doubao_data_dir().join("Local State");
     if !path.exists() {
         return Ok(None);
     }
@@ -1547,12 +1541,10 @@ pub fn doubao_snapshot_meta(state: State<AppState>, user_id: String) -> Result<O
 // 独立备份 = 把这些本地状态复制到 data/doubao_chats/<uid>/，与快照解耦：
 // 重装/换机后先恢复对话数据再登录，客户端体验立即可用；配合云端同步，对话不丢。
 
-/// 豆包 User Data 目录（与 env.rs 安装探测一致的默认位置；
-/// 基根 Windows=%LOCALAPPDATA%，mac=Application Support）
+/// 豆包 User Data 目录（单一事实源 switcher::profile::doubao_data_dir，
+/// 合并审查 #1：Windows 带 User Data 层，mac 直挂 Doubao 根）
 fn doubao_user_data_dir() -> PathBuf {
-    crate::platform::local_data_root_lossy()
-        .join("Doubao")
-        .join("User Data")
+    crate::switcher::profile::doubao_data_dir()
 }
 
 /// 对话数据备份根目录：data/doubao_chats/<uid>/
