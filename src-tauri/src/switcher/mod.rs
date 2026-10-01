@@ -6,7 +6,8 @@
 //!
 //! 红线对齐：
 //! - 前端零改动：NDJSON 行 `{stage,status,message,time}` 与 `*-done {success,raw}`
-//!   语义逐字段兼容，全部 stage 消息文案逐字保留；
+//!   语义逐字段兼容，全部 stage 消息文案逐字保留（3.6.5 起 backup 消息随 .bak2
+//!   两代轮转更新文案——前端仅透传展示、无精确匹配，已核实）；
 //! - 快照数据零迁移：profiles*/<slot>{,.bak,.bak2} 结构、current_account.txt、
 //!   meta.json、snapshot_meta.json 格式不变，新旧版本快照互认（.bak2 与
 //!   <slot>.meta.json 身份 sidecar 为新增，旧版本可无视）；
@@ -356,11 +357,14 @@ fn fatal_line(msg: &str) -> String {
 /// 写进 4487 槽）。仅 icube 布局（TraeWork/Trae）有可靠日志数据源。
 ///
 /// 必须在 stop_app 之后（日志已完整落盘）、backup_current 之前（后者内部
-/// rotate_bak 会覆盖槽位，拦截必须发生在任何写操作前）调用。探测与目标不符 →
-/// 重启客户端还原现场并拒绝，绝不 rotate。
+/// rotate_bak 会覆盖槽位，拦截必须发生在任何写操作前）调用，且调用方须在
+/// stop 前以 [`proc::is_running`] 记录 `was_running`。探测与目标不符 →
+/// 仅当 `was_running` 为真才重启客户端还原现场（原本没开的不拉起），拒绝，
+/// 绝不 rotate。
 fn icube_save_identity_guard(
     sess: &mut Session,
     uid: &str,
+    was_running: bool,
     sink: &dyn ProgressSink,
 ) -> Result<(), String> {
     if sess.prof.layout != Layout::Icube {
@@ -373,14 +377,16 @@ fn icube_save_identity_guard(
                  （防止账号 {uid} 的槽位被账号 {live} 的登录态覆盖污染）。\
                  请先「切换」到账号 {uid} 并在客户端确认登录，再点「保存当前登录态」。"
             );
-            // 还原现场：用户客户端原本开着（stop 后被我们关掉），拉回来；
-            // 失败仅 Warn，不影响拒绝结果
-            if let Err(e) = proc::start_app(sess, sink) {
-                sink.step(
-                    "guard",
-                    StepStatus::Warn,
-                    &format!("客户端重启失败，请手动打开: {e}"),
-                );
+            // 还原现场：仅当客户端原本在运行（调用方 stop 前经 is_running 确认）
+            // 才拉回，避免把原本没开的客户端意外拉起；失败仅 Warn，不影响拒绝结果
+            if was_running {
+                if let Err(e) = proc::start_app(sess, sink) {
+                    sink.step(
+                        "guard",
+                        StepStatus::Warn,
+                        &format!("客户端重启失败，请手动打开: {e}"),
+                    );
+                }
             }
             // 流内 fatal 行（NDJSON 语义：错误终态必有最后一行 fatal）+
             // Err 载荷带 [fatal] 前缀（前端 saveCurrentLogin 失败 toast 按
@@ -544,8 +550,9 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
     let r = match args.action {
         Action::Switch => switch_flow(&mut sess, uid.trim(), args.expected_current_uid.trim(), sink),
         Action::SaveCurrentLogin => {
+            let was_running = proc::is_running(&sess);
             proc::stop_app(&mut sess, sink)?;
-            icube_save_identity_guard(&mut sess, uid.trim(), sink)?;
+            icube_save_identity_guard(&mut sess, uid.trim(), was_running, sink)?;
             backup_current(&sess, uid.trim(), sink)?;
             set_current_account(&sess, uid.trim());
             proc::start_app(&mut sess, sink)?;
@@ -554,8 +561,9 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
         Action::BackupCurrent => {
             // 审查修复：与 SaveCurrentLogin 对齐——先关客户端再读 auth/leveldb/vscdb，
             // 防止文件锁下拷贝静默缺文件生成"看似成功"的坏快照；备份完成后拉回
+            let was_running = proc::is_running(&sess);
             proc::stop_app(&mut sess, sink)?;
-            icube_save_identity_guard(&mut sess, uid.trim(), sink)?;
+            icube_save_identity_guard(&mut sess, uid.trim(), was_running, sink)?;
             backup_current(&sess, uid.trim(), sink)?;
             set_current_account(&sess, uid.trim());
             proc::start_app(&mut sess, sink)?;

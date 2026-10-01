@@ -1211,7 +1211,7 @@ function DoubaoHelpModal({ open, onClose }: { open: boolean; onClose: () => void
           </h3>
           <ol className="ml-4 list-decimal space-y-1 text-xs leading-relaxed text-slate-600 dark:text-zinc-300">
             <li>点击目标账号行的「切换」图标</li>
-            <li>系统自动关闭豆包，并将当前登录态备份（原账号槽 + <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">last</code> 槽作为安全回退；被覆盖的旧快照保留为 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">&lt;账号&gt;.bak</code> 可回退一代，但不在列表中显示）</li>
+            <li>系统自动关闭豆包，并将当前登录态备份（原账号槽 + <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">last</code> 槽作为安全回退；被覆盖的旧快照保留为 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">&lt;账号&gt;.bak</code> 与 <code className="rounded bg-slate-100 px-1 dark:bg-zinc-800">&lt;账号&gt;.bak2</code> 可回退两代，但不在列表中显示）</li>
             <li>恢复目标账号的快照（Cookies、Local State、Local Storage、saman 账号体系等）</li>
             <li>重新启动豆包，自动以目标账号登录</li>
           </ol>

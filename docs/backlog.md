@@ -297,7 +297,7 @@
 | R1 | ~~**mac 真机编译验证**（双架构）~~ ✅ 2026-09-20 | 无 | 已完成：双架构 cargo check 0 错 0 警 + cargo test 431 全绿 0 警（详见 v2.8 进展） |
 | R2 | ~~**M-1 真机侦察**（设计 §7 共 9 项，先决）~~ ✅ 2026-09-20 | mac 机 + 各应用 mac 版账号 | 已完成：9 项结论见 v2.8 进展；仅 ④⑦ 留待 R4 切换实测顺带验证 |
 | R3 | ~~**M1-1.4 档案表 mac 路径回填**~~ ✅ 2026-09-20 | R2 | 已完成：五档案 os 维度化 + 四域放开 + proc/locate/icube/authfile/proxy_ctl 侦察驱动修复（详见 v2.8 进展）；遗留：`mac_data_dir_guess` 字段与 platform 层 allow 标注待 R4 后评估移除 |
-| R4 | **M1-1.5 切换全链路 mac 实测** | R2、R3 | WorkBuddy 双账号互切（快照备份 → 恢复 → 守卫回滚）按设计 §十 验收矩阵 2/3 执行；Trae 域按侦察结论决定覆盖范围；`switcher/mod.rs` 主体预期零改动纯验证 |
+| R4 | **M1-1.5 切换全链路 mac 实测** | R2、R3 | WorkBuddy 双账号互切（快照备份 → 恢复 → 守卫回滚）按设计 §十 验收矩阵 2/3 执行；Trae 域按侦察结论决定覆盖范围；`switcher/mod.rs` 主体预期零改动纯验证。**追加（2026-10-01 合并审查）**：验证 mac Trae 数据根下 `logs/<yyyymmddThhmmss>/dynamicConfig.log` 会话日志结构是否与 Windows 同构——该结构目前仅有 Windows 真机证据（`icube.rs` detect_live_uid 的 L2 守卫数据源）；若 mac 不同构，L2 恒 fail-open 静默失效（防护退化为 L1 命令层守卫，无功能破坏），需评估 mac 侧身份探测替代数据源 |
 | R5 | **M2 mac 真机复核** | R1（可与 R2 并行） | 逐项冒烟：`scutil --proxies` 读 / `networksetup` 逐服务写+还原 / `security add-trusted-cert` GUI 授权 / SO_REUSEADDR 重复启停无端口残留 / CA 信任后 MITM 抓包闭环（验收矩阵 6：装证书 → 接管代理 → 捕获 → 还原） |
 | R6 | **M3 dmg 构建 + 更新闭环验证**（x86_64 本地形态 ✅ 2026-09-20） | R1（推荐尽早，不依赖 R2） | 已完成：本地 `npm run tauri build -- --target x86_64-apple-darwin --bundles dmg` 产出 `AI Work 助手_3.5.6_x64.dmg`（含二轮审查修复）。剩余：aarch64/universal 形态走 CI `build-macos.yml` 首跑；updater mac 闭环实测（发现 dmg → 下载 → SHA256 fail-closed → open dmg → 重启，验收矩阵 8）；Gatekeeper 无签名首启引导实测（右键打开 + `xattr -d`，验收矩阵 1） |
 | R7 | **M4 集成验收 + 首个 mac 发布演练** | R1~R6 | 验收矩阵 1-9 全项通过（含 Windows 回归 §9.3：cargo test 全绿 + tsc + NSIS/MSI/portable 产物不变 + 手工冒烟）；tag 发布 Release 四资产 + 新 mac 机从 dmg 安装到登录使用成功；更新 CHANGELOG 与 AGENT.md SOP 实测补充 |
