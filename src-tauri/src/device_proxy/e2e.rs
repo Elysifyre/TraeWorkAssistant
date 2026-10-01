@@ -1,4 +1,4 @@
-﻿//! 端到端测试：真实 [`ProxyServer`] + 假上游代理 + 假后端，模拟客户端走代理完整链路。
+//! 端到端测试：真实 [`ProxyServer`] + 假上游代理 + 假后端，模拟客户端走代理完整链路。
 //!
 //! 背景（豆包白屏问题，proxy.log 22:21）：「目标域直连」策略在用户 VPN 客户端
 //! 接管路由/DNS 的环境下全线失效——47 个 MITM 转发请求 0 响应（TCP 可连但数据
@@ -179,6 +179,29 @@ async fn read_head(io: &mut TcpStream) -> Vec<u8> {
     buf
 }
 
+/// 读完整响应头后短超时补读 body，直到出现 marker——小响应 body 可能与头同段
+/// 到达，也可能落在后继 TCP 段（慢 runner 上更常见， read_head 只保头不保 body）
+async fn read_head_and_body(io: &mut TcpStream, marker: &[u8]) -> Vec<u8> {
+    let mut buf = read_head(io).await;
+    if buf.windows(marker.len()).any(|w| w == marker) {
+        return buf;
+    }
+    let _ = tokio::time::timeout(Duration::from_millis(2000), async {
+        let mut chunk = [0u8; 1024];
+        while let Ok(n) = io.read(&mut chunk).await {
+            if n == 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            if buf.windows(marker.len()).any(|w| w == marker) {
+                break;
+            }
+        }
+    })
+    .await;
+    buf
+}
+
 // ---------------- 离线端到端用例 ----------------
 
 /// 目标域明文 http 请求必须经上游转发（修复回归测试：旧代码此处直连、seen=0）
@@ -198,21 +221,7 @@ async fn target_plain_http_routes_via_upstream() {
     // 上游桩的目标映射，而非直连解析）
     let req = format!("GET http://api.e2e.test:{backend}/ping HTTP/1.1\r\nHost: api.e2e.test\r\n\r\n");
     c.write_all(req.as_bytes()).await.unwrap();
-    let mut resp = read_head(&mut c).await;
-    // 小响应可能与头同块到达，也可能在后继读里；短超时再读一段凑齐 body
-    let _ = tokio::time::timeout(Duration::from_millis(2000), async {
-        let mut chunk = [0u8; 1024];
-        while let Ok(n) = c.read(&mut chunk).await {
-            if n == 0 {
-                break;
-            }
-            resp.extend_from_slice(&chunk[..n]);
-            if resp.windows(6).any(|w| w == b"e2e-ok") {
-                break;
-            }
-        }
-    })
-    .await;
+    let resp = read_head_and_body(&mut c, b"e2e-ok").await;
     let resp = String::from_utf8_lossy(&resp);
     assert!(resp.contains("200"), "应返回 200，实际: {resp}");
     assert!(resp.contains("e2e-ok"), "应返回后端 body，实际: {resp}");
@@ -262,11 +271,12 @@ async fn connect_tunnel_routes_via_upstream() {
     let head = String::from_utf8_lossy(&raw);
     assert!(head.contains("200"), "CONNECT 应答 200，实际: {head}");
     // 隧道内发一个真实 HTTP 请求，验证双向透传到后端
+    // （body 可能与头异段到达——慢 runner 上 read_head 只拿到头，需补读，见 helper 注释）
     c.write_all(format!("GET / HTTP/1.1\r\nHost: tunnel.example.com:{backend}\r\n\r\n").as_bytes())
         .await
         .unwrap();
-    let raw = read_head(&mut c).await;
-    let resp = String::from_utf8_lossy(&raw);
+    let resp = read_head_and_body(&mut c, b"e2e-ok").await;
+    let resp = String::from_utf8_lossy(&resp);
     assert!(resp.contains("200") && resp.contains("e2e-ok"), "隧道内应拿到后端响应: {resp}");
     assert_eq!(up.seen.load(Ordering::SeqCst), 1, "CONNECT 隧道必须经上游");
 }
