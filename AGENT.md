@@ -1,4 +1,4 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v3.6.4
+# AGENT.md — AI Work 助手 (ai-work-assistant) v3.6.5
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > 注：品牌已由 Trae Work Assistant 迁移为 **AI Work 助手（ai-work-assistant）**，本机仓库目录暂为 `trae-work-assistant`，后续可整体重命名。
@@ -440,3 +440,12 @@ ai-work-assistant/
 5. **孤儿提交勿清理**：`git gc` / `git prune` 一律不跑，dangling 提交（如 6c1fdca）是无害保险，误删不可逆。
 6. **慎用 `git pack-refs --all`**：它会把 loose ref 收编进 packed-refs，正是制造本坑的前提条件；本仓库避免执行。
 7. **关联环境故障**：同日 bash `rm` shim 损坏曾误删 docs/（已恢复）。删除文件一律用 Python `os.remove`，禁用裸 `rm`；修复类操作前先 `git status` 快照留证。
+
+## 16. 远端同步规范（新任务开工前 / 提交推送前必守）
+
+> 多端协作下本地极易落后远端（他端已推的修复 / tag / 新分支本地不可见），基于陈旧基线开发会产生无谓冲突或重复修复。**以下两个时机必须先同步、后动作**：
+
+1. **开始新的需求任务前**：`git fetch --all --tags --prune` 同步全量远端引用（所有分支 / tags / 提交），当前分支落后时 `git pull` 到最新再开工。
+2. **git 提交和推送前**：同样先 `fetch --all --tags --prune`，用 `git status -sb` 比对 ahead/behind，落后先 `git pull`（优先 fast-forward）再提交推送；推送被拒（non-fast-forward）时**禁止 `--force`**，先排查远端新增提交内容。
+
+**红线**：同步必须落在动作**前**（不是想起来再补）；`--prune` 必带（清理远端已删分支的本地幽灵引用）；pull 出现冲突时按 §交互规范 跟踪冲突块双方意图，不盲提 merge commit。

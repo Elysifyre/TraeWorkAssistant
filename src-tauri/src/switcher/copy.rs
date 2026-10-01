@@ -40,26 +40,30 @@ fn dir_copy_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// .bak 单代轮转（PS 689-698/975-984/1269-1278 三处同构，收敛为一个函数）：
-/// 覆盖已有槽位前，把现有快照整体挪到 <slot>.bak（上一代 .bak 直接淘汰）。
+/// .bak 两代轮转（PS 689-698/975-984/1269-1278 三处同构，收敛为一个函数）：
+/// 覆盖已有槽位前，把现有快照整体挪到 <slot>.bak，上一代 .bak 再挪到
+/// <slot>.bak2（三代滚动淘汰，.bak2 仅供人工找回，不参与自动回退链）。
 /// 背景：Switch 的"备份当前登录态到来源槽"依赖 current_account.txt 与实际登录
-/// 一致；一旦不一致会把错误状态反复刷进该槽且不可恢复——有 .bak 后任何一次
-/// 覆盖都可回退一代。
+/// 一致；一旦不一致会把错误状态反复刷进该槽——单代 .bak 在连续两次误覆盖后
+/// 原始快照即永久丢失（2026-09-29 实测事故），双代留出人工找回窗口。
 pub fn rotate_bak(dest: &Path, slot: &str, sink: &dyn ProgressSink) {
     if !dest.exists() {
         return;
     }
     // 显式拼名 <slot>.bak（不用 with_extension：slot 含点号时扩展名歧义）
-    let bak = dest
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(format!("{slot}.bak"));
-    let _ = std::fs::remove_dir_all(&bak);
+    let parent = dest.parent().unwrap_or_else(|| Path::new("."));
+    let bak = parent.join(format!("{slot}.bak"));
+    let bak2 = parent.join(format!("{slot}.bak2"));
+    // 顺序敏感：Windows rename 目标存在即失败，必须先腾出 .bak 再逐代后移
+    let _ = std::fs::remove_dir_all(&bak2);
+    // .bak 不存在（首轮轮转）时 rename 失败属预期；存在却失败（如被占用）则保留
+    // .bak 原样，后续 rename(dest→bak) 失败仅 Warn，尽量少丢数据
+    let _ = std::fs::rename(&bak, &bak2);
     match std::fs::rename(dest, &bak) {
         Ok(()) => sink.step(
             "backup",
             StepStatus::Info,
-            &format!("原 {slot} 快照已备份到 {slot}.bak（可回滚一代）"),
+            &format!("原 {slot} 快照已备份到 {slot}.bak（连同 .bak2 可回滚两代）"),
         ),
         Err(e) => sink.step(
             "backup",
@@ -153,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn rotate_bak_单代淘汰与空格中文路径() {
+    fn rotate_bak_两代轮转与空格中文路径() {
         let base = tmpdir("带 空格 中文");
         let sink = QuietSink;
         let slot = base.join("profiles").join("槽位 A");
@@ -166,12 +170,32 @@ mod tests {
                 .unwrap(),
             "gen1"
         );
-        // 二次轮转：上一代 .bak 淘汰
+        assert!(!base.join("profiles").join("槽位 A.bak2").exists());
+        // 二次轮转：gen1 后移到 .bak2，gen2 进入 .bak
         std::fs::create_dir_all(&slot).unwrap();
         std::fs::write(slot.join("f.txt"), "gen2").unwrap();
         rotate_bak(&slot, "槽位 A", &sink);
         assert_eq!(
             std::fs::read_to_string(base.join("profiles").join("槽位 A.bak").join("f.txt"))
+                .unwrap(),
+            "gen2"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("profiles").join("槽位 A.bak2").join("f.txt"))
+                .unwrap(),
+            "gen1"
+        );
+        // 三次轮转：gen1 淘汰，.bak=gen3、.bak2=gen2（原始快照多留一代找回窗口）
+        std::fs::create_dir_all(&slot).unwrap();
+        std::fs::write(slot.join("f.txt"), "gen3").unwrap();
+        rotate_bak(&slot, "槽位 A", &sink);
+        assert_eq!(
+            std::fs::read_to_string(base.join("profiles").join("槽位 A.bak").join("f.txt"))
+                .unwrap(),
+            "gen3"
+        );
+        assert_eq!(
+            std::fs::read_to_string(base.join("profiles").join("槽位 A.bak2").join("f.txt"))
                 .unwrap(),
             "gen2"
         );

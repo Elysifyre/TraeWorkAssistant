@@ -282,6 +282,24 @@ pub(super) fn as_ts_seconds(v: Option<&serde_json::Value>) -> Option<i64> {
     })
 }
 
+/// 诊断用键名提取（issue #51）：仅列键名、绝不含值，顶层 + auth/account 一层子对象。
+/// 供「未找到 accessToken」类错误自带结构线索，用户截图即可定位，省去跑 PowerShell 往返。
+pub(super) fn auth_key_names(raw: &serde_json::Value) -> String {
+    if !raw.is_object() {
+        return "（非 JSON 对象）".into();
+    }
+    let mut names: Vec<String> = Vec::new();
+    if let Some(map) = raw.as_object() {
+        names.extend(map.keys().cloned());
+        for wk in ["auth", "account"] {
+            if let Some(child) = map.get(wk).and_then(|v| v.as_object()) {
+                names.extend(child.keys().map(|k| format!("{wk}.{k}")));
+            }
+        }
+    }
+    if names.is_empty() { "（对象无键）".into() } else { names.join(", ") }
+}
+
 // ── 设置（F-55 配置化）──────────────────────────────────────────────────────
 
 #[tauri::command]

@@ -10,8 +10,8 @@ use crate::state::AppState;
 
 use super::cli::{load_cli_rotate_state, save_cli_rotate_state};
 use super::common::{
-    account_id_of, as_str, as_ts_seconds, auth_file_path_of, is_running, load_pool, save_pool,
-    snapshot_json_path, upsert_token_store, wb_data_dir, wb_renew_locks,
+    account_id_of, as_str, as_ts_seconds, auth_file_path_of, auth_key_names, is_running,
+    load_pool, save_pool, snapshot_json_path, upsert_token_store, wb_data_dir, wb_renew_locks,
     WorkBuddyAccount, WbPool,
 };
 
@@ -250,8 +250,13 @@ pub fn workbuddy_scan_auth_file(state: State<AppState>) -> Result<Option<WorkBud
     if !raw.is_object() {
         return Err("auth 文件格式无法识别（JSON 解析失败）".into());
     }
-    let access = as_str(fs_utils::dig(&raw, &["accessToken", "access_token"]))
-        .ok_or("auth 文件中未找到 accessToken（结构可能已变更）")?;
+    // token 键对齐 tasks 侧 creds_of 超集（wb_common.rs）：含通用 `token`
+    let access = as_str(fs_utils::dig(&raw, &["accessToken", "access_token", "token"])).ok_or_else(|| {
+        format!(
+            "auth 文件中未找到 accessToken（结构可能已变更）；实际键名: {}",
+            auth_key_names(&raw)
+        )
+    })?;
     if access.is_empty() {
         return Err("auth 文件 accessToken 为空（可能未登录）".into());
     }
@@ -267,7 +272,11 @@ pub fn workbuddy_scan_auth_file(state: State<AppState>) -> Result<Option<WorkBud
         edition_type: as_str(fs_utils::dig(&raw, &["editionType", "edition"])).unwrap_or_default(),
         has_access_token: true,
         has_refresh_token: as_str(fs_utils::dig(&raw, &["refreshToken", "refresh_token"])).is_some(),
-        access_token_expires_at: as_ts_seconds(fs_utils::dig(&raw, &["expiresAtMs", "expiresAt", "expires_in_ms"])),
+        // expires 键对齐 creds_of 超集：as_ts_seconds 自动识别毫秒级（>1e12 折算秒）
+        access_token_expires_at: as_ts_seconds(fs_utils::dig(
+            &raw,
+            &["expiresAtMs", "expires_at_ms", "expiresAt", "expires_in_ms", "accessTokenExpiresAtMs"],
+        )),
         exists,
         already_in_pool,
     }))
@@ -408,8 +417,13 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
         return Err("未找到 auth 文件，请先在 WorkBuddy 客户端登录".into());
     }
     let raw = fs_utils::read_json::<serde_json::Value>(&path);
-    let access = as_str(fs_utils::dig(&raw, &["accessToken", "access_token"]))
-        .ok_or("auth 文件中未找到 accessToken")?;
+    // token 键对齐 creds_of 超集 + 失败时自带键名诊断（与 scan 同口径）
+    let access = as_str(fs_utils::dig(&raw, &["accessToken", "access_token", "token"])).ok_or_else(|| {
+        format!(
+            "auth 文件中未找到 accessToken（结构可能已变更）；实际键名: {}",
+            auth_key_names(&raw)
+        )
+    })?;
     let refresh = as_str(fs_utils::dig(&raw, &["refreshToken", "refresh_token"]));
     let id = account_id_of(&access);
     let uid = as_str(fs_utils::dig(&raw, &["uid"])).unwrap_or_default();
@@ -426,7 +440,11 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
             uid: uid.clone(),
             nickname,
             edition_type: as_str(fs_utils::dig(&raw, &["editionType", "edition"])).unwrap_or_default(),
-            access_token_expires_at: as_ts_seconds(fs_utils::dig(&raw, &["expiresAtMs", "expiresAt", "expires_in_ms"])),
+            // expires 键对齐 creds_of 超集（与 scan 同口径）
+            access_token_expires_at: as_ts_seconds(fs_utils::dig(
+                &raw,
+                &["expiresAtMs", "expires_at_ms", "expiresAt", "expires_in_ms", "accessTokenExpiresAtMs"],
+            )),
             refresh_token_expires_at: as_ts_seconds(fs_utils::dig(&raw, &["refreshExpiresAt", "refresh_expires_at"])),
         },
     );
@@ -438,7 +456,11 @@ pub fn workbuddy_account_import_auth(state: State<AppState>, name: Option<String
         "access_token": access,
         "refresh_token": refresh,
         // 审查 P2：到期时间兼容整数毫秒/秒与 RFC3339 字符串（as_ts_seconds 归一为秒，再折算毫秒存储）
-        "expires_at_ms": as_ts_seconds(fs_utils::dig(&raw, &["expiresAtMs", "expiresAt"])).map(|s| s * 1000),
+        "expires_at_ms": as_ts_seconds(fs_utils::dig(
+            &raw,
+            &["expiresAtMs", "expires_at_ms", "expiresAt", "expires_in_ms", "accessTokenExpiresAtMs"],
+        ))
+        .map(|s| s * 1000),
         "uid": uid,
         "domain": as_str(fs_utils::dig(&raw, &["domain"])),
     });
@@ -555,7 +577,7 @@ pub fn workbuddy_refresh_token(
     let resp = agent
         .post("https://www.codebuddy.cn/v2/plugin/auth/token/refresh")
         .set("Authorization", "Bearer")
-        .set("User-Agent", "WorkBuddy")
+        .set("User-Agent", crate::tasks::wb_common::WB_DESKTOP_UA)
         .set("X-Refresh-Token", &refresh)
         .set("X-Auth-Refresh-Source", "workbuddy")
         .set("Content-Type", "application/json")
@@ -787,7 +809,11 @@ pub fn workbuddy_accounts_import(state: State<AppState>, payload: serde_json::Va
 
 #[cfg(test)]
 mod tests {
-    use super::{lazy_renew_skippable, merge_auth_entry, AuthMerge, WorkBuddyAccount, WbPool};
+    use super::{
+        as_str, as_ts_seconds, auth_key_names, lazy_renew_skippable, merge_auth_entry, AuthMerge,
+        WorkBuddyAccount, WbPool,
+    };
+    use crate::fs_utils;
 
     fn entry(id: &str, uid: &str, nickname: &str) -> WorkBuddyAccount {
         WorkBuddyAccount {
@@ -905,5 +931,51 @@ mod tests {
     #[test]
     fn lazy_renew_expired_renews() {
         assert!(!lazy_renew_skippable(Some(WB_T0 - 3600), WB_T0));
+    }
+
+    // ── auth 文件键名诊断 + 提取键对齐（issue #51）─────────────────────────
+
+    /// 诊断键名：顶层 + auth/account 子对象键名（带前缀），绝不包含值
+    #[test]
+    fn auth_key_names_lists_top_and_child_keys() {
+        let raw = serde_json::json!({
+            "domain": "wb.example.com",
+            "auth": { "accessToken": "secret-token", "refreshToken": "r" },
+            "account": { "uid": "u1", "nickname": "n" }
+        });
+        let s = auth_key_names(&raw);
+        assert!(s.contains("domain"));
+        assert!(s.contains("auth.accessToken"));
+        assert!(s.contains("auth.refreshToken"));
+        assert!(s.contains("account.uid"));
+        assert!(!s.contains("secret-token"), "诊断信息绝不能包含值");
+    }
+
+    /// 诊断键名：非对象 / 空对象兜底
+    #[test]
+    fn auth_key_names_non_object_and_empty() {
+        assert_eq!(auth_key_names(&serde_json::json!("str")), "（非 JSON 对象）");
+        assert_eq!(auth_key_names(&serde_json::json!([1])), "（非 JSON 对象）");
+        assert_eq!(auth_key_names(&serde_json::json!({})), "（对象无键）");
+    }
+
+    /// P2 键对齐：通用 `token` 键与 accessTokenExpiresAtMs 经 dig 可命中（原键列表会漏），
+    /// 毫秒级到期经 as_ts_seconds 归一为秒
+    #[test]
+    fn dig_hits_generic_token_and_new_expiry_keys() {
+        let raw = serde_json::json!({
+            "auth": { "token": "t", "accessTokenExpiresAtMs": 1_700_000_000_000i64 }
+        });
+        assert_eq!(
+            as_str(fs_utils::dig(&raw, &["accessToken", "access_token", "token"])),
+            Some("t".into())
+        );
+        assert_eq!(
+            as_ts_seconds(fs_utils::dig(
+                &raw,
+                &["expiresAtMs", "expires_at_ms", "expiresAt", "expires_in_ms", "accessTokenExpiresAtMs"]
+            )),
+            Some(1_700_000_000)
+        );
     }
 }

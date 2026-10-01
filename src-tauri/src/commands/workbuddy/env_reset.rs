@@ -347,7 +347,8 @@ fn state_vscdb_backup_exists() -> bool {
 /// 当前生效 accessToken：auth 文件优先，回退 token store 中有效期最新的账号凭证（仅用于解析 Keycloak iss）
 fn current_access_token(state: &AppState) -> Option<String> {
     let raw = fs_utils::read_json::<serde_json::Value>(&auth_file_path_of(state));
-    if let Some(t) = as_str(fs_utils::dig(&raw, &["accessToken"])) {
+    // token 键对齐 creds_of 超集（issue #51）：原仅 accessToken，access_token/token 命中不了
+    if let Some(t) = as_str(fs_utils::dig(&raw, &["accessToken", "access_token", "token"])) {
         if !t.is_empty() {
             return Some(t);
         }

@@ -7,8 +7,9 @@
 //! 红线对齐：
 //! - 前端零改动：NDJSON 行 `{stage,status,message,time}` 与 `*-done {success,raw}`
 //!   语义逐字段兼容，全部 stage 消息文案逐字保留；
-//! - 快照数据零迁移：profiles*/<slot>{,.bak} 结构、current_account.txt、
-//!   meta.json、snapshot_meta.json 格式不变，新旧版本快照互认；
+//! - 快照数据零迁移：profiles*/<slot>{,.bak,.bak2} 结构、current_account.txt、
+//!   meta.json、snapshot_meta.json 格式不变，新旧版本快照互认（.bak2 与
+//!   <slot>.meta.json 身份 sidecar 为新增，旧版本可无视）；
 //! - 日志落点不变：`<data_dir>/logs/switcher.log` 追加格式
 //!   `[yyyy-MM-dd HH:mm:ss] [stage] message`。
 
@@ -115,6 +116,9 @@ pub struct Session {
     /// 独立字段便于测试注入临时路径）
     pub auth_dir: PathBuf,
     pub auth_file: PathBuf,
+    /// L2 守卫探测到的客户端当前登录 uid（icube 布局，stop 后从日志提取）；
+    /// 由 icube_save_identity_guard 写入，backup_icube 据此写槽位 sidecar
+    pub detected_live_uid: Option<String>,
 }
 
 impl Session {
@@ -128,6 +132,7 @@ impl Session {
             include_indexeddb: args.include_indexeddb,
             auth_dir: authfile::wb_auth_dir(),
             auth_file: authfile::wb_auth_file(),
+            detected_live_uid: None,
         }
     }
 }
@@ -347,6 +352,65 @@ fn fatal_line(msg: &str) -> String {
 
 // ── 布局分派（PS Backup-CurrentProfile / Restore-Profile 分派头）────────────
 
+/// L2 身份硬校验（2026-09-29 实测事故：1335 登录态被「保存当前登录态→4487」
+/// 写进 4487 槽）。仅 icube 布局（TraeWork/Trae）有可靠日志数据源。
+///
+/// 必须在 stop_app 之后（日志已完整落盘）、backup_current 之前（后者内部
+/// rotate_bak 会覆盖槽位，拦截必须发生在任何写操作前）调用。探测与目标不符 →
+/// 重启客户端还原现场并拒绝，绝不 rotate。
+fn icube_save_identity_guard(
+    sess: &mut Session,
+    uid: &str,
+    sink: &dyn ProgressSink,
+) -> Result<(), String> {
+    if sess.prof.layout != Layout::Icube {
+        return Ok(());
+    }
+    match icube::detect_live_uid(&sess.prof.data_dir) {
+        Some(live) if live != uid => {
+            let msg = format!(
+                "客户端当前登录的是账号 {live}，与要保存的账号 {uid} 不一致，已拒绝保存\
+                 （防止账号 {uid} 的槽位被账号 {live} 的登录态覆盖污染）。\
+                 请先「切换」到账号 {uid} 并在客户端确认登录，再点「保存当前登录态」。"
+            );
+            // 还原现场：用户客户端原本开着（stop 后被我们关掉），拉回来；
+            // 失败仅 Warn，不影响拒绝结果
+            if let Err(e) = proc::start_app(sess, sink) {
+                sink.step(
+                    "guard",
+                    StepStatus::Warn,
+                    &format!("客户端重启失败，请手动打开: {e}"),
+                );
+            }
+            // 流内 fatal 行（NDJSON 语义：错误终态必有最后一行 fatal）+
+            // Err 载荷带 [fatal] 前缀（前端 saveCurrentLogin 失败 toast 按
+            // /\[fatal\]\s*(.+)$/ 提取完整原因，与 panic 兜底既有约定一致）
+            sink.step("fatal", StepStatus::Error, &format!("失败: {msg}"));
+            Err(fatal_line(&format!("[fatal] {msg}")))
+        }
+        Some(live) => {
+            sink.step(
+                "guard",
+                StepStatus::Ok,
+                &format!("身份校验通过：客户端当前登录的是账号 {live}"),
+            );
+            // 一致：记录身份供 backup_icube 写入槽位 sidecar（restore 前校验用）
+            sess.detected_live_uid = Some(live);
+            Ok(())
+        }
+        None => {
+            // 探测失败（无日志/最新会话无 uid 记录）：fail-open 放行，
+            // 与 F2-5 authfile 守卫的 None 放行策略一致
+            sink.step(
+                "guard",
+                StepStatus::Warn,
+                "未能从客户端日志判定当前登录账号，跳过身份校验",
+            );
+            Ok(())
+        }
+    }
+}
+
 fn backup_current(sess: &Session, slot: &str, sink: &dyn ProgressSink) -> Result<(), String> {
     match sess.prof.layout {
         Layout::Authfile => authfile::backup_authfile(sess, slot, sink),
@@ -481,6 +545,7 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
         Action::Switch => switch_flow(&mut sess, uid.trim(), args.expected_current_uid.trim(), sink),
         Action::SaveCurrentLogin => {
             proc::stop_app(&mut sess, sink)?;
+            icube_save_identity_guard(&mut sess, uid.trim(), sink)?;
             backup_current(&sess, uid.trim(), sink)?;
             set_current_account(&sess, uid.trim());
             proc::start_app(&mut sess, sink)?;
@@ -490,6 +555,7 @@ pub fn run_action(args: RunArgs, sink: &dyn ProgressSink) -> Result<String, Stri
             // 审查修复：与 SaveCurrentLogin 对齐——先关客户端再读 auth/leveldb/vscdb，
             // 防止文件锁下拷贝静默缺文件生成"看似成功"的坏快照；备份完成后拉回
             proc::stop_app(&mut sess, sink)?;
+            icube_save_identity_guard(&mut sess, uid.trim(), sink)?;
             backup_current(&sess, uid.trim(), sink)?;
             set_current_account(&sess, uid.trim());
             proc::start_app(&mut sess, sink)?;

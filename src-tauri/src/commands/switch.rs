@@ -387,6 +387,27 @@ pub fn save_current_login(
         }
     }
 
+    // L1 保存守卫（icube 布局，TraeWork/Trae）：与 F2-5 同型，数据源为
+    // current_cloud_uid_hybrid（本机使用证据 + 桥标记混合推导）。与 L2 日志硬校验
+    // （switcher::icube_save_identity_guard，stop 后读客户端日志）构成双层防护：
+    // L1 在命令层 fail-fast（客户端尚未被关停，体验最好），L2 兜底防 L1 数据源失真
+    // 后误放行。检测不可用（None，如未登录/无证据无标记）→ fail-open 放行。
+    if matches!(target_app.as_deref(), None | Some("TraeWork") | Some("Trae")) {
+        let kind = target_app.as_deref().unwrap_or("TraeWork");
+        if let Some(live) =
+            crate::commands::trae_apps::current_cloud_uid_hybrid(kind, &state.data_dir)
+        {
+            if !live.is_empty() && live != user_id.trim() {
+                let msg = format!(
+                    "客户端当前登录的是账号 {live}，与要保存的账号 {user_id} 不一致，已拒绝保存（防止账号 {user_id} 的槽位被账号 {live} 的登录态覆盖污染）。\
+                     请先「切换」到账号 {user_id} 并在客户端确认登录，再点「保存当前登录态」。"
+                );
+                fs_utils::app_log(&state.data_dir, &format!("保存登录态被守卫拦截: {msg}"));
+                return Err(msg);
+            }
+        }
+    }
+
     fs_utils::app_log(&state.data_dir, &format!("开始保存当前登录态: user_id={user_id}"));
 
     // C4：豆包快照可选纳入 IndexedDB
