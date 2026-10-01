@@ -85,6 +85,10 @@ pub fn creds_of(source: &Value) -> Creds {
                 "expiresAtMs",
                 "expires_at_ms",
                 "expiresAt",
+                // 审查 No.3 语义假设：expires_in_ms 按绝对毫秒时间戳处理（与 main
+                // 同口径）。若上游某版本将其用作相对时长（如 3600000），<1e12 会被
+                // 误判为 1970 年过期 → 提前触发一次 refresh 用 expiresIn 回填自愈，
+                // 保守无害；真实 auth 文件使用 expiresAtMs（绝对毫秒），不会触发
                 "expires_in_ms",
                 "accessTokenExpiresAtMs",
             ],
@@ -165,23 +169,54 @@ pub fn save_token_store(state: &AppState, id: &str, creds: &Creds) -> Result<(),
     crate::store::docs::wb_token_store_save(&crate::store::db(&state.data_dir), &store)
 }
 
+// ── 客户端指纹伪装（issue #48）─────────────────────────────────────────────
+
+/// billing/签到/刷新链路桌面端 UA 伪装：必须带版本号——裸 "WorkBuddy" 在
+/// 个人中心「请求明细」的客户端列识别为 "-"（issue #48 反馈的可检测特征）。
+pub const WB_DESKTOP_UA: &str = "WorkBuddy/5.5.6";
+
+/// 账号级稳定设备指纹：sha256("wb-fingerprint:{kind}:{uid}") 前 16 字节 →
+/// 32 位小写十六进制。同账号恒定（虚拟设备稳定）、跨账号隔离（防关联）；
+/// uid 为空返回 None（缺失即不带，不伪造）。
+pub fn derive_device_fingerprint(uid: &str, kind: &str) -> Option<String> {
+    if uid.trim().is_empty() {
+        return None;
+    }
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(format!("wb-fingerprint:{kind}:{uid}").as_bytes());
+    let d = h.finalize();
+    Some(d[..16].iter().map(|b| format!("{b:02x}")).collect())
+}
+
 // ── 统一请求头（§5.3）───────────────────────────────────────────────────────
 
-/// Bearer + X-User-Id（缺省 X-No-* 占位）；web_platform=true 附加
-/// X-Client-Platform: web（积分三件套必需）。
+/// Bearer + X-User-Id（缺省 X-No-* 占位）+ 客户端指纹（issue #48：UA 带版本、
+/// X-Machine-ID/X-Session-ID 账号级稳定派生、X-Domain 域标识）；web_platform=true
+/// 附加 X-Client-Platform: web（积分三件套必需）。
 pub fn build_auth_headers(creds: &Creds, web_platform: bool) -> Vec<(String, String)> {
     let mut h = vec![
         (
             "Authorization".to_string(),
             format!("Bearer {}", creds.access_token),
         ),
-        ("User-Agent".to_string(), "WorkBuddy".to_string()),
+        ("User-Agent".to_string(), WB_DESKTOP_UA.to_string()),
         ("Content-Type".to_string(), "application/json".to_string()),
     ];
     if creds.uid.is_empty() {
         h.push(("X-No-User-Id".to_string(), "1".to_string()));
     } else {
         h.push(("X-User-Id".to_string(), creds.uid.clone()));
+        // 客户端指纹（issue #48）：个人中心请求明细按设备/会话标识识别客户端
+        if let Some(mid) = derive_device_fingerprint(&creds.uid, "machine") {
+            h.push(("X-Machine-ID".to_string(), mid));
+        }
+        if let Some(sid) = derive_device_fingerprint(&creds.uid, "session") {
+            h.push(("X-Session-ID".to_string(), sid));
+        }
+    }
+    if !creds.domain.is_empty() {
+        h.push(("X-Domain".to_string(), creds.domain.clone()));
     }
     if web_platform {
         h.push(("X-Client-Platform".to_string(), "web".to_string()));
@@ -471,4 +506,68 @@ pub fn ensure_fresh(
         return (new, true, "refreshed");
     }
     (creds, false, "refresh_failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ==================== 客户端指纹伪装（issue #48） ====================
+
+    #[test]
+    fn derive_device_fingerprint_deterministic_and_isolated() {
+        // 同账号恒定、32 位小写 hex；不同 kind / 不同 uid 互异；uid 空缺失即不带
+        let a1 = derive_device_fingerprint("u-1", "machine").unwrap();
+        let a2 = derive_device_fingerprint("u-1", "machine").unwrap();
+        assert_eq!(a1, a2, "同账号指纹必须恒定");
+        assert_eq!(a1.len(), 32);
+        assert!(a1.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(
+            derive_device_fingerprint("u-1", "machine").unwrap(),
+            derive_device_fingerprint("u-1", "session").unwrap()
+        );
+        assert_ne!(
+            derive_device_fingerprint("u-1", "machine").unwrap(),
+            derive_device_fingerprint("u-2", "machine").unwrap(),
+            "跨账号必须隔离防关联"
+        );
+        assert!(derive_device_fingerprint("", "machine").is_none());
+        assert!(derive_device_fingerprint("  ", "machine").is_none());
+    }
+
+    #[test]
+    fn auth_headers_carry_client_fingerprint() {
+        let creds = Creds {
+            access_token: "tk".into(),
+            uid: "u-1".into(),
+            domain: "d1".into(),
+            ..Default::default()
+        };
+        let h = build_auth_headers(&creds, false);
+        let get = |hs: &[(String, String)], k: &str| {
+            hs.iter()
+                .find(|(hk, _)| hk.eq_ignore_ascii_case(k))
+                .map(|(_, v)| v.clone())
+        };
+        // UA 带版本（issue #48：裸 "WorkBuddy" 在个人中心明细识别为 "-"）
+        assert_eq!(get(&h, "User-Agent").as_deref(), Some(WB_DESKTOP_UA));
+        assert_eq!(get(&h, "X-User-Id").as_deref(), Some("u-1"));
+        assert_eq!(get(&h, "X-Domain").as_deref(), Some("d1"));
+        // 设备/会话指纹：与派生函数一致、32 位 hex
+        let mid = get(&h, "X-Machine-ID").expect("X-Machine-ID 必须存在");
+        let sid = get(&h, "X-Session-ID").expect("X-Session-ID 必须存在");
+        assert_eq!(mid, derive_device_fingerprint("u-1", "machine").unwrap());
+        assert_eq!(sid, derive_device_fingerprint("u-1", "session").unwrap());
+        assert_eq!(mid.len(), 32);
+        // web 平台附加
+        let hw = build_auth_headers(&creds, true);
+        assert!(hw.iter().any(|(k, v)| k == "X-Client-Platform" && v == "web"));
+        // uid/domain 缺失：X-No-* 占位、不带指纹与域标识
+        let empty = build_auth_headers(&Creds::default(), false);
+        assert_eq!(get(&empty, "X-No-User-Id").as_deref(), Some("1"));
+        assert!(get(&empty, "X-User-Id").is_none());
+        assert!(get(&empty, "X-Machine-ID").is_none());
+        assert!(get(&empty, "X-Session-ID").is_none());
+        assert!(get(&empty, "X-Domain").is_none());
+    }
 }

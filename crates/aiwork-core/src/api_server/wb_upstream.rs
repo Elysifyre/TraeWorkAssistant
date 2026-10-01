@@ -13,6 +13,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::time::Duration;
 
 use crate::fs_utils;
+use crate::tasks::wb_common;
 
 /// 对话上游 base（按区域）
 pub const WB_CHAT_HOST_CN: &str = "https://copilot.tencent.com";
@@ -20,6 +21,8 @@ pub const WB_CHAT_HOST_GLOBAL: &str = "https://www.workbuddy.ai";
 pub const WB_CHAT_PATH: &str = "/v2/chat/completions";
 /// UA 伪装（F-28）
 pub const WB_UA: &str = "CLI/2.63.2 CodeBuddy/2.63.2";
+/// CLI 客户端版本（与 WB_UA 版本一致；X-IDE-Version 指纹头用，issue #48）
+pub const WB_CLI_VERSION: &str = "2.63.2";
 /// 刷新端点（红线：唯一允许携带 X-Refresh-Token 的地方）
 pub const WB_REFRESH_URL: &str = "https://www.codebuddy.cn/v2/plugin/auth/token/refresh";
 /// 首字超时（F-34）：上游建连后 10s 内未产出任何字节 → 故障转移
@@ -73,7 +76,7 @@ pub fn wb_agent() -> ureq::Agent {
 pub fn build_chat_headers(c: &WbCreds) -> Vec<(&'static str, String)> {
     let base = c.chat_base();
     let referer = format!("{}{}", base, WB_CHAT_PATH);
-    let h: Vec<(&'static str, String)> = vec![
+    let mut h: Vec<(&'static str, String)> = vec![
         ("content-type", "application/json".into()),
         ("accept", "text/event-stream".into()),
         ("user-agent", WB_UA.into()),
@@ -96,7 +99,26 @@ pub fn build_chat_headers(c: &WbCreds) -> Vec<(&'static str, String)> {
             if c.domain.is_empty() { "1".into() } else { c.domain.clone() },
         ),
         ("X-Product", "SaaS".into()),
+        // 客户端指纹（issue #48）：CLI 身份头（与 UA 版本一致）+ 请求标识——
+        // 个人中心「请求明细」按这些头识别客户端，缺失时客户端列显示 "-"
+        ("X-IDE-Type", "CLI".into()),
+        ("X-IDE-Name", "CLI".into()),
+        ("X-IDE-Version", WB_CLI_VERSION.into()),
+        // X-Request-ID：每请求随机 32 位 hex。用 ThreadRng（rand::random，CSPRNG、
+        // OsRng 种子）替代 main 的 uuid::Uuid::new_v4().simple()，免去新增 uuid
+        // 依赖；不走 commands::oauth::random_hex——其 OsRng 失败时会退化为
+        // 时间种子 LCG（可预测），请求标识要求恒定不可预测（审查 No.2）
+        ("X-Request-ID", format!("{:032x}", rand::random::<u128>())),
     ];
+    // 设备/会话指纹（issue #48）：账号级稳定派生（同账号恒定、跨账号隔离）；
+    // uid 缺失即不带，不伪造
+    if let (Some(mid), Some(sid)) = (
+        wb_common::derive_device_fingerprint(&c.uid, "machine"),
+        wb_common::derive_device_fingerprint(&c.uid, "session"),
+    ) {
+        h.push(("X-Machine-ID", mid));
+        h.push(("X-Session-ID", sid));
+    }
     // 铁律 3（红线）：chat 请求绝不携带 X-Refresh-Token——构造器根本不产出该头，
     // debug_assert 兜底防未来误加。
     debug_assert!(
@@ -440,7 +462,7 @@ pub fn refresh_access_token(data_dir: &std::path::Path, account_id: &str) -> Res
         .build()
         .post(WB_REFRESH_URL)
         .set("Authorization", "Bearer")
-        .set("User-Agent", "WorkBuddy")
+        .set("User-Agent", wb_common::WB_DESKTOP_UA)
         .set("X-Refresh-Token", &refresh)
         .set("X-Auth-Refresh-Source", "workbuddy")
         .set("Content-Type", "application/json")
@@ -553,6 +575,9 @@ mod tests {
         assert!(get("X-User-Id").is_none());
         assert_eq!(get("X-No-Enterprise-Id").as_deref(), Some("1"));
         assert_eq!(get("X-No-Department-Info").as_deref(), Some("1"));
+        // 指纹缺失即不带（uid 为空不伪造，issue #48）
+        assert!(get("X-Machine-ID").is_none());
+        assert!(get("X-Session-ID").is_none());
         // 完整字段时走正头
         let h = build_chat_headers(&creds(false, "u1", "e1", "d1"));
         let get = |k: &str| {
@@ -564,6 +589,42 @@ mod tests {
         assert_eq!(get("X-Product").as_deref(), Some("SaaS"));
         // UA 伪装
         assert_eq!(get("user-agent").as_deref(), Some(WB_UA));
+        // CLI 身份指纹（issue #48）：与 UA 版本一致
+        assert_eq!(get("X-IDE-Type").as_deref(), Some("CLI"));
+        assert_eq!(get("X-IDE-Name").as_deref(), Some("CLI"));
+        assert_eq!(get("X-IDE-Version").as_deref(), Some(WB_CLI_VERSION));
+        // 设备/会话指纹：32 位 hex、machine ≠ session
+        let mid = get("X-Machine-ID").expect("X-Machine-ID 必须存在");
+        let sid = get("X-Session-ID").expect("X-Session-ID 必须存在");
+        assert_eq!(mid.len(), 32);
+        assert!(mid.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(mid, sid);
+        assert_ne!(
+            mid,
+            build_chat_headers(&creds(false, "u2", "", ""))
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("X-Machine-ID"))
+                .map(|(_, v)| v.clone())
+                .unwrap(),
+            "跨账号指纹必须隔离防关联"
+        );
+    }
+
+    #[test]
+    fn request_id_varies_per_call() {
+        // X-Request-ID 每次请求随机（32 位 hex）
+        let c = creds(false, "u", "", "");
+        let rid = |h: &[(&'static str, String)]| {
+            h.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("X-Request-ID"))
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        let a = rid(&build_chat_headers(&c));
+        let b = rid(&build_chat_headers(&c));
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
     }
 
     #[test]
