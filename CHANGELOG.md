@@ -6,6 +6,38 @@
 
 ---
 
+## [1.3.5] · 2026-10-01 · 移植 main 客户端指纹伪装 + auth 键诊断
+
+> **合并点记录**：本次移植范围 `main@31fa051c52beb9b0e227f87dd87b5f94f6d28477`（**含**）至 `main@29d106af1da7bc6e1df477c8f0b7c4ebb9811ab3`；**下次合并请从 `29d106a` 之后接着移植**。手工语义移植、未经 merge。
+
+### 修复（移植 main `e845bf2`，issue #48）
+
+- **WB 客户端指纹伪装补齐**：个人中心「请求明细」客户端列不再显示 "-"——
+  - chat 链路（`wb_upstream.rs::build_chat_headers`）：新增 `X-IDE-Type/Name/Version`（CLI 身份，版本与 UA 一致，新常量 `WB_CLI_VERSION`）+ `X-Request-ID`（每请求随机 32 位 hex）+ `X-Machine-ID/X-Session-ID`（账号级稳定派生）。
+  - billing/签到链路（`wb_common.rs::build_auth_headers`）：UA 升级为 `WorkBuddy/5.5.6` 带版本形态（新常量 `WB_DESKTOP_UA`，裸 "WorkBuddy" 会被识别为 "-"）+ 指纹头 + `X-Domain`。
+  - 刷新端点（`wb_upstream.rs::refresh_access_token` / `workbuddy/accounts.rs`）UA 同步对齐。
+  - 指纹派生 `derive_device_fingerprint`：sha256(`wb-fingerprint:{kind}:{uid}`) 前 16 字节 → 32 位 hex；同账号恒定、跨账号隔离防关联；uid 缺失即不带不伪造。
+  - **docker 分支兼容性偏离**：`X-Request-ID` 用 core 既有 `commands::oauth::random_hex(32)` 产出（与 main 的 `uuid::Uuid::new_v4().simple()` 同为 32 位 hex），避免为 aiwork-core 新增 uuid 依赖。
+
+### 修复（移植 main `07aa845`，issue #51）
+
+- **auth 文件提取键对齐 creds_of 超集**：scan/import 的 token 键补通用 `token`，expires 键补 `expires_at_ms` / `accessTokenExpiresAtMs`（`as_ts_seconds` 自动毫秒折算秒）。
+- **失败错误自带键名诊断**：新增 `common.rs::auth_key_names`——「未找到 accessToken」错误附带顶层及 auth/account 一层子对象键名（仅键名绝不含值），用户截图即可定位结构变更。
+- main 同提交中的 `env_reset.rs` 三键口径同步**未移植**：docker 分支无桌面环境重置模块。
+
+### 文档（移植 main `1b8937d` + `d2d4843`）
+
+- AGENT.md 新增「远端同步规范」（main §16 → docker §15，编号偏移已在文中注明）。
+- 新增 `docs/tmp/trae-cli-bridge-plan.md`（Trae CLI 桥接落地方案：个人账号不可用实证 + 企业后端模拟四阶段计划）。
+
+### 明确跳过（桌面客户端专属，docker 分支不适用）
+
+- main `11c25bc`（switch 登录态双层身份守卫 + 槽位 sidecar + .bak 两代轮转）：依赖 `src-tauri/src/switcher/` 与 `commands/switch.rs` 桌面槽位切换模块，docker 分支无此模块。
+- main `31fa051` 的 `wb_route.rs` 模块头注释修正：已随 1.3.4 断连检测移植带入。
+- main `31fa051` / `29d106a` 的 3.6.4/3.6.5 版本升级：docker 分支走独立 1.3.x 版本线（本次升级 1.3.4 → 1.3.5）。
+
+---
+
 ## [1.3.4] · 2026-09-29 · SSE 断连检测全链路移植
 
 ### 修复（移植 main@31fa051 自 8665e4c 以来的系统无关变更）

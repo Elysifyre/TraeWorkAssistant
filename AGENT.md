@@ -1,4 +1,4 @@
-# AGENT.md — AI Work 助手 (ai-work-assistant) v1.3.4
+# AGENT.md — AI Work 助手 (ai-work-assistant) v1.3.5
 
 > 项目级别速查手册。给后续会话（人或 AI）秒接上下文用。任何会改契约的提交请同步更新本文档。
 > **产品形态（2026-09 Web 化转型已落地）**：Web-only 单体——`crates/aiwork-core`（业务核心，零桌面依赖）+ `crates/aiwork-server`（axum：管理面 `/api/*` + 网关 `/v1/*` + 静态托管 + 调度器），浏览器直访，Docker 部署。桌面壳（Tauri/托盘/代理/切换器/豆包/CC Switch/更新器）已整体退役并删除 `src-tauri/`（git 历史归档）。转型决策与裁剪清单见 `docs/tmp/docker-headless-server-plan.md`（ADR-1~4）。
@@ -208,3 +208,14 @@ $AIWORK_DATA_DIR（Docker: /app/data）
 4. **修复只走 packed-refs 原位替换**：`git update-ref` 与直写 loose 文件在本环境均会被静默丢弃，**唯一可靠手段**是用 Python 原位替换 `packed-refs` 中该分支行；替换后 `git rev-parse` 读回验证。
 5. **孤儿提交勿清理**：`git gc` / `git prune` 一律不跑；删除文件禁用裸 `rm`。
 6. **慎用 `git pack-refs --all`**：它会把 loose ref 收编进 packed-refs，正是制造本坑的前提。
+
+## 15. 远端同步规范（新任务开工前 / 提交推送前必守）
+
+> 多端协作下本地极易落后远端（他端已推的修复 / tag / 新分支本地不可见），基于陈旧基线开发会产生无谓冲突或重复修复。**以下两个时机必须先同步、后动作**：
+
+1. **开始新的需求任务前**：`git fetch --all --tags --prune` 同步全量远端引用（所有分支 / tags / 提交），当前分支落后时 `git pull` 到最新再开工。
+2. **git 提交和推送前**：同样先 `fetch --all --tags --prune`，用 `git status -sb` 比对 ahead/behind，落后先 `git pull`（优先 fast-forward）再提交推送；推送被拒（non-fast-forward）时**禁止 `--force`**，先排查远端新增提交内容。
+
+**红线**：同步必须落在动作**前**（不是想起来再补）；`--prune` 必带（清理远端已删分支的本地幽灵引用）；pull 出现冲突时按 §交互规范 跟踪冲突块双方意图，不盲提 merge commit。
+
+> 来源：移植自 main 分支 §16（1b8937d）；docker_main 与 main 的章节编号存在偏移，后续移植以内容标题为准。
